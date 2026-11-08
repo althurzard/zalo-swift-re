@@ -294,7 +294,14 @@ final class AssistantDesk {
                     self.update(draft.id, .failed(block)); continue
                 }
                 self.update(draft.id, .sending)
-                let ok = await self.engine?.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId) ?? false
+                var ok = await self.engine?.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId) ?? false
+                // A conversation the official client has not loaded yet ('not-open'): open it on screen, then retry once.
+                if !ok, let engine = self.engine, engine.openConversationId != draft.conversationId {
+                    engine.navigationRequest = draft.conversationId
+                    for _ in 0..<40 where engine.openConversationId != draft.conversationId { try? await Task.sleep(for: .milliseconds(250)) }
+                    try? await Task.sleep(for: .seconds(1.5))
+                    ok = await engine.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId)
+                }
                 if ok {
                     self.guardrail.record(text: draft.text, conversationId: draft.conversationId)
                     self.update(draft.id, .sent(Date()))
