@@ -346,6 +346,16 @@
         if (done) return;
         done = true;
         const list = Array.isArray(files) ? files : Array.from(input.files || []);
+        if (meta.length) {
+          for (const f of list) {
+            if (!f.path) {
+              const matched = meta.find((m) => m && m.name === f.name);
+              if (matched && matched.path) {
+                try { Object.defineProperty(f, 'path', { value: String(matched.path), configurable: true, enumerable: true }); } catch {}
+              }
+            }
+          }
+        }
         input.remove();
         resolve(list);
       };

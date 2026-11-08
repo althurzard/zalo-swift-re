@@ -215,6 +215,7 @@ struct ChatComposer: View {
             ComposerTextView(
                 text: $draft, mentions: $mentions, height: $textHeight, focusTick: focusTick,
                 handle: handle, mentionsEnabled: isGroup,
+                hasStagedImages: !staged.isEmpty,
                 onMentionQuery: { query = $0 },
                 onSuggestionKey: suggestionKey,
                 onPasteboardAction: handlePasteboard,
@@ -630,6 +631,10 @@ final class ComposerHandle {
     func focus() {
         guard let tv = textView else { return }
         tv.window?.makeFirstResponder(tv)
+        DispatchQueue.main.async { [weak tv] in
+            guard let tv, let window = tv.window, window.attachedSheet == nil else { return }
+            window.makeFirstResponder(tv)
+        }
     }
 
     func insertPlainText(_ text: String) {
@@ -736,6 +741,7 @@ struct ComposerTextView: NSViewRepresentable {
     var focusTick: Int
     var handle: ComposerHandle? = nil
     var mentionsEnabled = false
+    var hasStagedImages = false
     var onMentionQuery: (MentionQuery?) -> Void = { _ in }
     /// While the popover is open: ↑ ↓ Return/Tab Esc. Returns true when consumed.
     var onSuggestionKey: (MentionKey) -> Bool = { _ in false }
@@ -793,6 +799,7 @@ struct ComposerTextView: NSViewRepresentable {
         tv.setAccessibilityLabel("Nhập tin nhắn")
         Self.setContent(tv, text: text, mentions: mentions)
         context.coordinator.parent.handle?.textView = tv
+        tv.hasStagedImages = hasStagedImages
         tv.onWidthChange = { [weak coordinator = context.coordinator, weak tv] in
             guard let tv else { return }
             coordinator?.remeasure(tv)
@@ -802,6 +809,12 @@ struct ComposerTextView: NSViewRepresentable {
         }
         tv.onDropTargetChange = { [weak coordinator = context.coordinator] targeted in
             coordinator?.parent.onDropTargetChange(targeted)
+        }
+        tv.onSuggestionKey = { [weak coordinator = context.coordinator] key in
+            coordinator?.parent.onSuggestionKey(key) ?? false
+        }
+        tv.onSend = { [weak coordinator = context.coordinator] in
+            coordinator?.parent.onSend()
         }
 
         let scroll = NSScrollView()
@@ -818,8 +831,9 @@ struct ComposerTextView: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
-        guard let tv = scroll.documentView as? NSTextView else { return }
+        guard let tv = scroll.documentView as? FieldTextView else { return }
         handle?.textView = tv
+        tv.hasStagedImages = hasStagedImages
         if tv.string != text, tv.hasMarkedText() {
             // IME composition in progress: keep the external text until it is committed (`textDidChange`).
             context.coordinator.deferExternal(base: tv.string, text: text, mentions: mentions)
@@ -978,25 +992,34 @@ struct ComposerTextView: NSViewRepresentable {
         private var lastQuery: MentionQuery?
 
         func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            let isReturn = selector == #selector(NSResponder.insertNewline(_:))
+                || selector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
+                || selector == #selector(NSResponder.insertLineBreak(_:))
             switch selector {
             case #selector(NSResponder.moveUp(_:)): if parent.onSuggestionKey(.up) { return true }
             case #selector(NSResponder.moveDown(_:)): if parent.onSuggestionKey(.down) { return true }
             case #selector(NSResponder.insertTab(_:)): if parent.onSuggestionKey(.confirm) { return true }
             case #selector(NSResponder.cancelOperation(_:)): if parent.onSuggestionKey(.cancel) { return true }
-            case #selector(NSResponder.insertNewline(_:)):
-                let mods = NSApp.currentEvent?.modifierFlags ?? []
-                if !mods.contains(.shift), !mods.contains(.option), !textView.hasMarkedText(),
-                   parent.onSuggestionKey(.confirm) { return true }
-            default: break
+            default:
+                if isReturn {
+                    let mods = NSApp.currentEvent?.modifierFlags ?? []
+                    if !mods.contains(.shift), !mods.contains(.option), !textView.hasMarkedText(),
+                       parent.onSuggestionKey(.confirm) { return true }
+                }
             }
-            guard selector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            guard isReturn else { return false }
             let mods = NSApp.currentEvent?.modifierFlags ?? []
             if mods.contains(.shift) || mods.contains(.option) {
                 textView.insertNewlineIgnoringFieldEditor(nil)
                 return true
             }
             // Return confirming IME composition never reaches here, but be defensive.
-            if textView.hasMarkedText() { return false }
+            if textView.hasMarkedText() {
+                guard parent.hasStagedImages else { return false }
+                textView.inputContext?.discardMarkedText()
+                textView.unmarkText()
+                textDidChange(Notification(name: NSText.didChangeNotification, object: textView))
+            }
             parent.onSend()
             return true
         }
@@ -1017,6 +1040,10 @@ struct ComposerTextView: NSViewRepresentable {
         var onWidthChange: (() -> Void)?
         var onPasteboardAction: ((NSPasteboard, Bool) -> Bool)?
         var onDropTargetChange: ((Bool) -> Void)?
+        var onSuggestionKey: ((MentionKey) -> Bool)?
+        var onSend: (() -> Void)?
+        var hasStagedImages = false
+        private var keyMonitor: Any?
 
         override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
             var types = super.readablePasteboardTypes
@@ -1042,13 +1069,80 @@ struct ComposerTextView: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            guard let window, window.attachedSheet == nil else { return }
+            if let keyMonitor {
+                NSEvent.removeMonitor(keyMonitor)
+                self.keyMonitor = nil
+            }
+            guard let window else { return }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let consumed = MainActor.assumeIsolated { self?.handleWindowKeyDown(event) ?? false }
+                return consumed ? nil : event
+            }
+            guard window.attachedSheet == nil else { return }
             if let responderTV = window.firstResponder as? NSTextView, responderTV.isEditable { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, let win = self.window, win.attachedSheet == nil else { return }
                 if let responderTV = win.firstResponder as? NSTextView, responderTV.isEditable { return }
                 win.makeFirstResponder(self)
             }
+        }
+
+        override func keyDown(with event: NSEvent) {
+            let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            if (event.keyCode == 36 || event.keyCode == 76), flags.isEmpty {
+                if !hasMarkedText() {
+                    if onSuggestionKey?(.confirm) == true { return }
+                    onSend?()
+                    return
+                } else if hasStagedImages {
+                    inputContext?.discardMarkedText()
+                    unmarkText()
+                    delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: self))
+                    if onSuggestionKey?(.confirm) == true { return }
+                    onSend?()
+                    return
+                }
+            }
+            super.keyDown(with: event)
+        }
+
+        private func handleWindowKeyDown(_ event: NSEvent) -> Bool {
+            guard isEditable,
+                  !isHiddenOrHasHiddenAncestor,
+                  let window = self.window,
+                  event.window === window,
+                  window.attachedSheet == nil else {
+                return false
+            }
+            if let other = window.firstResponder as? NSTextView, other !== self, other.isEditable {
+                return false
+            }
+            let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+            guard (event.keyCode == 36 || event.keyCode == 76), flags.isEmpty else {
+                return false
+            }
+            if window.firstResponder === self {
+                if !hasMarkedText() {
+                    if onSuggestionKey?(.confirm) == true { return true }
+                    onSend?()
+                    return true
+                } else if hasStagedImages {
+                    inputContext?.discardMarkedText()
+                    unmarkText()
+                    delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: self))
+                    if onSuggestionKey?(.confirm) == true { return true }
+                    onSend?()
+                    return true
+                }
+                return false
+            }
+            if hasStagedImages || !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                window.makeFirstResponder(self)
+                if onSuggestionKey?(.confirm) == true { return true }
+                onSend?()
+                return true
+            }
+            return false
         }
 
         override func setFrameSize(_ newSize: NSSize) {
@@ -1059,6 +1153,7 @@ struct ComposerTextView: NSViewRepresentable {
 
         override func paste(_ sender: Any?) {
             if onPasteboardAction?(NSPasteboard.general, false) == true {
+                hasStagedImages = true
                 return
             }
             super.pasteAsPlainText(sender)
@@ -1066,6 +1161,7 @@ struct ComposerTextView: NSViewRepresentable {
 
         override func pasteAsPlainText(_ sender: Any?) {
             if onPasteboardAction?(NSPasteboard.general, false) == true {
+                hasStagedImages = true
                 return
             }
             super.pasteAsPlainText(sender)
@@ -1073,6 +1169,7 @@ struct ComposerTextView: NSViewRepresentable {
 
         override func pasteAsRichText(_ sender: Any?) {
             if onPasteboardAction?(NSPasteboard.general, false) == true {
+                hasStagedImages = true
                 return
             }
             super.pasteAsPlainText(sender)
@@ -1118,7 +1215,9 @@ struct ComposerTextView: NSViewRepresentable {
         override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
             onDropTargetChange?(false)
             if hasAttachmentInDrag(sender) {
-                return onPasteboardAction?(sender.draggingPasteboard, true) ?? false
+                let handled = onPasteboardAction?(sender.draggingPasteboard, true) ?? false
+                if handled { hasStagedImages = true }
+                return handled
             }
             return super.performDragOperation(sender)
         }

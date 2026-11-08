@@ -243,4 +243,53 @@ struct ComposerTests {
         engine.clearStagedImages(in: "conv-1")
         #expect(engine.stagedImages["conv-1"] == nil)
     }
+
+    @MainActor @Test func fieldTextViewReturnAndEnterKeyHandlingWithStagedImagesAndIME() throws {
+        let tv = ComposerTextView.FieldTextView()
+        tv.isEditable = true
+        var sentCount = 0
+        tv.onSend = { sentCount += 1 }
+        tv.string = "Xin chào"
+
+        let returnEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+            isARepeat: false, keyCode: 36
+        ))
+        let enterEvent = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+            isARepeat: false, keyCode: 76
+        ))
+        let shiftReturn = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [.shift], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+            isARepeat: false, keyCode: 36
+        ))
+
+        // 1. Without marked text, Return and Numpad Enter trigger onSend
+        tv.keyDown(with: returnEvent)
+        #expect(sentCount == 1)
+        tv.keyDown(with: enterEvent)
+        #expect(sentCount == 2)
+
+        // 2. Modifiers like Shift+Return do not send
+        tv.keyDown(with: shiftReturn)
+        #expect(sentCount == 2)
+
+        // 3. IME active (hasMarkedText) without staged images: Return should NOT trigger send (lets IME commit)
+        tv.setMarkedText("tiế", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: 0, length: 0))
+        #expect(tv.hasMarkedText())
+        tv.hasStagedImages = false
+        tv.keyDown(with: returnEvent)
+        #expect(sentCount == 2)
+
+        // 4. IME active with staged images: Return discards marked text and sends immediately
+        tv.setMarkedText("tiế", selectedRange: NSRange(location: 3, length: 0), replacementRange: NSRange(location: 0, length: 0))
+        #expect(tv.hasMarkedText())
+        tv.hasStagedImages = true
+        tv.keyDown(with: returnEvent)
+        #expect(sentCount == 3)
+        #expect(!tv.hasMarkedText())
+    }
 }
