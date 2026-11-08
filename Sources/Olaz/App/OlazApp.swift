@@ -25,10 +25,17 @@ struct OlazApp: App {
                     .keyboardShortcut("L", modifiers: [.command, .shift])
                     .disabled(engine.profile == nil)
             }
+            AssistantCommands(pending: engine.assistant.pendingCount)
             CommandMenu("Nhà phát triển") {
                 Toggle("Hiện renderer Zalo chính thức", isOn: $engine.isDebugRendererVisible)
             }
         }
+
+        Window("Duyệt nháp trả lời", id: "assistant-drafts") {
+            AssistantDraftsView()
+                .olazAppearance(engine: engine, shell: shell)
+        }
+        .defaultSize(width: 520, height: 640)
 
         Settings {
             SettingsView()
@@ -93,6 +100,19 @@ enum Appearance: String, CaseIterable, Identifiable {
         case .system: nil
         case .light: .light
         case .dark: .dark
+        }
+    }
+}
+
+/// "Trợ lý AI" menu: opens the draft review window.
+private struct AssistantCommands: Commands {
+    let pending: Int
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandMenu("Trợ lý AI") {
+            Button(pending > 0 ? "Duyệt nháp (\(pending))" : "Duyệt nháp") { openWindow(id: "assistant-drafts") }
+                .keyboardShortcut("D", modifiers: [.command, .shift])
         }
     }
 }

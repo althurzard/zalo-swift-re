@@ -20,6 +20,9 @@ struct SettingsView: View {
             Tab("Sticker", systemImage: "face.smiling") {
                 SettingsPane(height: 160) { StickerSettingsSection() }
             }
+            Tab("Trợ lý AI", systemImage: "sparkles") {
+                SettingsPane(height: 420) { AssistantSettings() }
+            }
             Tab("Tài khoản", systemImage: "person.crop.circle") {
                 SettingsPane(height: 400) { AccountSettings() }
             }

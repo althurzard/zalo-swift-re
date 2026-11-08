@@ -137,6 +137,8 @@ final class ZaloEngine {
     /// Message actions in flight ("conv|msg|action"): a second click while one runs is ignored.
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
 
+    /// AI assistant channel (proposals only; the user approves every send). See AssistantDesk.swift.
+    let assistant = AssistantDesk()
     @ObservationIgnored internal var host: OfficialClientHost?
     /// Dedupes/throttles `resolveMedia` (ZaloEngine+Media.swift).
     @ObservationIgnored internal let mediaResolver = MediaResolver()
@@ -327,6 +329,7 @@ final class ZaloEngine {
             if page == .main, case .signingIn = phase {
                 // The main client is up; conversations stream in as it syncs.
                 phase = .ready
+                assistant.attach(self)
             }
         case .failed(let error):
             log("[navigation] \(error.localizedDescription)")
