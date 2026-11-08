@@ -120,15 +120,17 @@ private extension Text {
 struct AssistantSettings: View {
     @Environment(ZaloEngine.self) private var engine
     @AppStorage(AssistantDesk.enabledKey) private var enabled = false
+    @AppStorage(AssistantDesk.chatApprovalKey) private var chatApproval = false
 
     var body: some View {
         Section {
             Toggle("Cho phép công cụ AI (MCP) đọc tin và đề xuất trả lời", isOn: $enabled)
                 .onChange(of: enabled) { _, on in engine.assistant.setEnabled(on) }
+            Toggle("Cho phép duyệt qua chat (nói \"duyệt\" với AI)", isOn: $chatApproval)
             LabeledContent("Trạng thái", value: engine.assistant.isListening ? "Đang lắng nghe" : "Tắt")
             LabeledContent("Socket") { Text(AssistantDesk.socketPath).font(.caption).textSelection(.enabled) }
         } footer: {
-            Text("AI chỉ tạo nháp. Mọi tin đều phải được bạn bấm Gửi trong cửa sổ Duyệt nháp (⌘⇧D).")
+            Text("AI chỉ tạo nháp. Tin chỉ được gửi khi bạn bấm Gửi (⌘⇧D) hoặc, nếu bật duyệt qua chat, khi bạn nói \"duyệt\" sau khi đọc preview. Giới hạn chống khoá luôn áp dụng.")
         }
         Section("Giới hạn chống khoá tài khoản") {
             LabeledContent("Khoảng cách giữa 2 tin", value: "≥ \(Int(SendGuard.minGap))–\(Int(SendGuard.minGap + SendGuard.maxJitter)) giây")

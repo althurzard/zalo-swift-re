@@ -12,6 +12,9 @@ import UserNotifications
 @Observable
 final class AssistantDesk {
     static let enabledKey = "olaz.assistant.enabled"
+    /// Lets the AI approve a draft the user OK'd in chat ("duyệt"). Off by default.
+    static let chatApprovalKey = "olaz.assistant.chatApproval"
+    static let minDraftAgeForChatApproval: TimeInterval = 5
     static var socketPath: String {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Olaz", isDirectory: true).appendingPathComponent("assistant.sock").path
@@ -182,6 +185,27 @@ final class AssistantDesk {
             let id = try string(p, "draftId")
             guard let d = drafts.first(where: { $0.id == id }) else { throw AssistantError("Không có nháp \(id)") }
             return Self.describe(d)
+        case "approve_draft":
+            guard UserDefaults.standard.bool(forKey: Self.chatApprovalKey) else {
+                throw AssistantError("Duyệt qua chat đang tắt (Olaz ▸ Cài đặt ▸ Trợ lý AI). Hãy duyệt trong cửa sổ Duyệt nháp (⌘⇧D).")
+            }
+            let id = try string(p, "draftId")
+            guard let i = drafts.firstIndex(where: { $0.id == id }) else { throw AssistantError("Không có nháp \(id)") }
+            guard drafts[i].state == .pending else { throw AssistantError("Nháp không còn chờ duyệt") }
+            // The approval must be for exactly the text the user read in the preview.
+            guard (p["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == drafts[i].text else {
+                throw AssistantError("Nội dung không khớp với nháp hiện tại — hãy gửi lại preview cho người dùng đọc trước khi duyệt")
+            }
+            guard Date().timeIntervalSince(drafts[i].created) >= Self.minDraftAgeForChatApproval else {
+                throw AssistantError("Nháp vừa tạo — người dùng cần đọc preview và nói \"duyệt\" trước")
+            }
+            approve(id)
+            // Wait for the outcome (SendGuard may queue it for a while).
+            for _ in 0..<120 {
+                if let d = drafts.first(where: { $0.id == id }), !(d.state == .sending), !{ if case .queued = d.state { true } else { false } }() { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            return drafts.first { $0.id == id }.map(Self.describe) ?? [:]
         case "withdraw_draft":
             let id = try string(p, "draftId")
             guard let i = drafts.firstIndex(where: { $0.id == id }), drafts[i].state == .pending else {

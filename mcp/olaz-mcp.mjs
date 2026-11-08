@@ -73,7 +73,8 @@ const TOOLS = [
   },
   {
     name: 'propose_reply',
-    description: 'Đề xuất một tin trả lời. KHÔNG gửi ngay: tin vào hàng chờ duyệt, người dùng phải bấm Gửi trong Olaz. '
+    description: 'Đề xuất một tin trả lời. KHÔNG gửi ngay: tin vào hàng chờ duyệt. Sau khi tạo, LUÔN gửi preview cho người dùng '
+      + '(người nhận, nội dung nguyên văn, draftId, cảnh báo) và chờ họ nói "duyệt". '
       + 'Chỉ trả lời khách đã nhắn trong 7 ngày. Viết riêng cho từng khách, tránh copy y hệt cho nhiều người, hạn chế link.',
     inputSchema: {
       type: 'object',
@@ -100,6 +101,20 @@ const TOOLS = [
     method: 'get_draft',
   },
   {
+    name: 'approve_draft',
+    description: 'Gửi một nháp mà người dùng ĐÃ đọc preview và nói rõ "duyệt" (hoặc "ok gửi", "gửi đi") trong tin nhắn MỚI NHẤT của họ. '
+      + 'KHÔNG BAO GIỜ tự gọi khi người dùng chưa đọc preview hoặc chưa nói duyệt; không suy diễn từ yêu cầu ban đầu như "soạn và gửi". '
+      + 'Nếu người dùng duyệt nhiều nháp, gọi lần lượt từng cái. text phải khớp nguyên văn nháp đã preview. '
+      + 'Olaz vẫn áp giới hạn chống khoá (có thể phải chờ 12–20 giây giữa các tin).',
+    inputSchema: {
+      type: 'object',
+      properties: { draftId: str('id nháp'), text: str('Nội dung nguyên văn đã preview cho người dùng') },
+      required: ['draftId', 'text'],
+    },
+    method: 'approve_draft',
+    timeoutMs: 60000,
+  },
+  {
     name: 'withdraw_draft',
     description: 'Rút lại một nháp còn đang chờ duyệt.',
     inputSchema: { type: 'object', properties: { draftId: str('id nháp') }, required: ['draftId'] },
@@ -119,8 +134,9 @@ async function handle(req) {
           protocolVersion: params?.protocolVersion || '2025-06-18',
           capabilities: { tools: {} },
           serverInfo: { name: 'olaz', version: '1.0.0' },
-          instructions: 'Đọc và soạn nháp trả lời khách Zalo qua Olaz. Mọi tin đều cần người dùng duyệt trong Olaz; '
-            + 'đừng hứa với người dùng là đã gửi — hãy nói "đã đưa vào hàng chờ duyệt".',
+          instructions: 'Đọc và soạn nháp trả lời khách Zalo qua Olaz. Quy trình: propose_reply → gửi preview nguyên văn cho người dùng '
+            + '→ chỉ khi người dùng nói "duyệt" thì approve_draft. Không bao giờ duyệt thay người dùng. '
+            + 'Chỉ báo "đã gửi" khi approve_draft trả về state=sent.',
         } });
       case 'ping':
         return send({ jsonrpc: '2.0', id, result: {} });
@@ -130,7 +146,7 @@ async function handle(req) {
         const tool = TOOLS.find((t) => t.name === params?.name);
         if (!tool) return send({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown tool' } });
         try {
-          const result = await callOlaz(tool.method, params.arguments || {});
+          const result = await callOlaz(tool.method, params.arguments || {}, tool.timeoutMs);
           return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 1) }] } });
         } catch (e) {
           return send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: String(e.message || e) }] } });
