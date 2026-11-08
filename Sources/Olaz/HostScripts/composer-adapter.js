@@ -71,12 +71,12 @@
   const M = {
     lang: null, toast: null, confirm: null, modal: null, overlimit: null, sendSrc: null, utils: null, consts: null,
     qr: null, phone: null, remember: null, verify: null, oa: null,
-    rmdUtils: null, topics: null, rmdConsts: null, rmdCfg: null, community: null,
+    rmdUtils: null, topics: null, rmdConsts: null, rmdCfg: null, community: null, jxlCfg: null,
   };
   const REQUIRED = ['lang', 'toast', 'confirm', 'modal', 'overlimit', 'sendSrc', 'utils', 'consts', 'qr', 'phone', 'remember', 'verify', 'oa', 'rmdUtils', 'topics', 'rmdConsts', 'rmdCfg', 'community'];
   let lastScan = 0;
   const scan = () => {
-    if (REQUIRED.every((k) => M[k])) return;
+    if (REQUIRED.every((k) => M[k]) && M.jxlCfg) return;
     if (Date.now() - lastScan < 1500) return;
     lastScan = Date.now();
     const req = window.__zaloRequire;
@@ -108,6 +108,7 @@
           if (!M.rmdUtils && has(o, 'isNoticeable', 'isAdminOrCreator', 'isOAType', 'getStringByteLength', 'checkAuth')) M.rmdUtils = o;
           if (!M.topics && has(o, 'createGroupTopicv2', 'createOneOneGroupTopic', 'getGroupInfoByLink')) M.topics = o;
           if (!M.rmdCfg && typeof o === 'function' && has(o, 'isNewUiEnabled', 'getMinLeadTimeMs', 'isOnlyMeEnabled')) M.rmdCfg = o;
+          if (!M.jxlCfg && typeof o === 'function' && typeof o.canForwardAsJXL === 'function') M.jxlCfg = o;
         }
       } catch {}
     }), null);
@@ -221,26 +222,118 @@
     finally { mine.running = false; mine.until = Date.now() + 2500; core.refresh(); }
   };
 
-  // DEVIATION FROM OFFICIAL (remote config `image_resizer.enable_libvips_macos`, 1 live). With it on, the official resizer (module
-  // "3Rxw" `resizeImage`) sends every JPEG / PNG through the native libvips module of Zalo PC for macOS, which this host does not have
-  // (local-modules.js answers `$zFeatures.libvips` as unavailable): each photo would fail to resize and end in the "Gửi dưới dạng file"
-  // confirm. With the switch off the resizer takes its official path for platforms without libvips — OffscreenCanvas in its web
-  // worker pool, as on Zalo Web. The value is held at 0 across remote-config refreshes (they assign `image_resizer` anew).
+  // DEVIATION FROM OFFICIAL (remote config `image_resizer.enable_libvips_macos` and `jxl.enable_upload` / `jxl.enable_upload_e2ee`).
+  // Zalo PC for macOS relies on native Node addons (`libvips` and `zjxl/jxl.node`) that this host does not load (`local-modules.js`
+  // stubs `$zFeatures.libvips` and `$zFeatures.libjxl` as unavailable). With `enable_libvips_macos` off, `3Rxw` resizes via
+  // OffscreenCanvas; with `jxl.enable_upload` / `enable_upload_e2ee` off, `sendPhotoMessage` (`DhYn` / `X2DH`) sends standard
+  // JPEG/PNG directly instead of stalling on the missing JXL worker in `pc-dist`.
   const pinResizerConfig = () => {
+    if (M.jxlCfg) {
+      safe(() => {
+        const cur = M.jxlCfg._DevOnlyConfig || M.jxlCfg.DevOnlyJxlConfig || {};
+        M.jxlCfg._DevOnlyConfig = Object.assign({}, cur, {
+          enable_upload: false,
+          enable_upload_e2ee: false,
+          enable_native_electron_jxl: false,
+        });
+      }, null);
+    }
     const c = S.cfg;
     if (!c || c.__olazResizer) return !!c;
-    let value = c.image_resizer;
-    const patched = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.assign({}, v, { enable_libvips_macos: 0 }) : v);
+    let resizerValue = c.image_resizer;
+    let jxlValue = c.jxl;
+    const patchedResizer = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.assign({}, v, { enable_libvips_macos: 0 }) : v);
+    const patchedJxl = (v) => (v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.assign({}, v, { enable_upload: false, enable_upload_e2ee: false, enable_native_electron_jxl: false })
+      : { enable_upload: false, enable_upload_e2ee: false, enable_native_electron_jxl: false });
     try {
-      Object.defineProperty(c, 'image_resizer', { configurable: true, enumerable: true, get: () => patched(value), set: (v) => { value = v; } });
+      Object.defineProperty(c, 'image_resizer', { configurable: true, enumerable: true, get: () => patchedResizer(resizerValue), set: (v) => { resizerValue = v; } });
+      Object.defineProperty(c, 'jxl', { configurable: true, enumerable: true, get: () => patchedJxl(jxlValue), set: (v) => { jxlValue = v; } });
       Object.defineProperty(c, '__olazResizer', { value: true });
     } catch (e) { diag('resizer config ' + scrubErr(e)); }
     return true;
   };
 
-  // ---- the files Swift picked: a hidden file input whose open panel Swift answers ----
-  // Must run synchronously inside the call Swift makes (its user gesture); resolves [] when nothing came back.
+  // ---- the files Swift picked ----
+  // Files <= 64 MB (clipboard images, Excel table renders, documents) are read straight into memory-backed `File`s via native XHR
+  // `arraybuffer` on `AsarSchemeHandler` (`/__olaz/pending-file/<token>/<index>`), avoiding `<input type=file>` gesture issues and
+  // custom-scheme Blob backing across Web Workers. Larger files (> 64 MB) use `<input type=file>` synchronously so WebKit streams
+  // them from disk.
+  const INLINE_FILE_LIMIT = 64 * 1024 * 1024;
+  const readPendingMetaSync = (token) => {
+    try {
+      const XHR = window.__zaloNativeXHR || XMLHttpRequest;
+      const xhr = new XHR();
+      const url = token ? `zalo-app://local/__olaz/pending-files/${encodeURIComponent(token)}` : 'zalo-app://local/__olaz/pending-files';
+      xhr.open('GET', url, false);
+      xhr.send(null);
+      if (xhr.status < 200 || xhr.status >= 300) return [];
+      const meta = JSON.parse(xhr.responseText || '[]');
+      return Array.isArray(meta) ? meta : [];
+    } catch (e) {
+      diag('pending meta ' + scrubErr(e));
+      return [];
+    }
+  };
+  const fetchArrayBuffer = (url) => new Promise((resolve, reject) => {
+    try {
+      const XHR = window.__zaloNativeXHR || XMLHttpRequest;
+      const xhr = new XHR();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300 && xhr.response) resolve(xhr.response);
+        else reject(new Error('HTTP ' + xhr.status));
+      };
+      xhr.onerror = () => reject(new Error('XHR network error'));
+      xhr.send(null);
+    } catch (e) {
+      reject(e);
+    }
+  });
+  const fallbackPendingFiles = async (token, preloadedMeta) => {
+    try {
+      const meta = Array.isArray(preloadedMeta) && preloadedMeta.length ? preloadedMeta : readPendingMetaSync(token);
+      if (!meta.length) return [];
+      const out = [];
+      for (const item of meta) {
+        const path = token
+          ? `zalo-app://local/__olaz/pending-file/${encodeURIComponent(token)}/${item.index}`
+          : `zalo-app://local/__olaz/pending-file/${item.index}`;
+        const buf = await fetchArrayBuffer(path);
+        const f = new File([new Uint8Array(buf)], item.name || 'file', {
+          type: item.mime || 'application/octet-stream',
+          lastModified: Number(item.lastModified) || Date.now(),
+        });
+        if (item.path) {
+          try { Object.defineProperty(f, 'path', { value: String(item.path), configurable: true, enumerable: true }); } catch {}
+        }
+        out.push(f);
+      }
+      return out;
+    } catch (e) {
+      diag('fallback pick ' + scrubErr(e));
+      return [];
+    }
+  };
+
   const pickFiles = () => {
+    const token = str(window.__olazPendingPickToken || '');
+    window.__olazPendingPickToken = '';
+    const meta = readPendingMetaSync(token);
+    if (meta.length) {
+      const q = (window.__olazPendingPhotoPaths = window.__olazPendingPhotoPaths || []);
+      const exts = photoExts();
+      for (const item of meta) {
+        if (item && item.path && exts.includes(extOf(item.name))) {
+          q.push({ path: String(item.path), name: String(item.name || ''), size: Number(item.size) || 0, ts: Date.now() });
+        }
+      }
+      while (q.length > 30) q.shift();
+    }
+    if (meta.length && meta.every((m) => Number(m.size) >= 0 && Number(m.size) <= INLINE_FILE_LIMIT)) {
+      return fallbackPendingFiles(token, meta);
+    }
     const input = document.createElement('input');
     input.type = 'file';
     input.multiple = true;
@@ -249,10 +342,23 @@
     (document.body || document.documentElement).appendChild(input);
     const picked = new Promise((resolve) => {
       let done = false;
-      const finish = () => { if (done) return; done = true; const list = Array.from(input.files || []); input.remove(); resolve(list); };
-      input.addEventListener('change', finish);
-      input.addEventListener('cancel', finish);
-      setTimeout(finish, 20000);
+      const finish = (files) => {
+        if (done) return;
+        done = true;
+        const list = Array.isArray(files) ? files : Array.from(input.files || []);
+        input.remove();
+        resolve(list);
+      };
+      input.addEventListener('change', () => finish());
+      input.addEventListener('cancel', () => {
+        fallbackPendingFiles(token, meta).then((list) => finish(list));
+      });
+      setTimeout(() => {
+        if (done) return;
+        const current = Array.from(input.files || []);
+        if (current.length) { finish(current); return; }
+        fallbackPendingFiles(token, meta).then((list) => finish(list));
+      }, 300);
     });
     try { input.click(); } catch (e) { diag('pick ' + scrubErr(e)); }
     return picked;
@@ -263,7 +369,11 @@
   const maxFiles = () => Number(cfg().maxNumberOfFile) || 50;
   const locked = (convId) => isGroupId(convId) && safe(() => !!(M.verify && M.verify.verifySetting({ field: 'lockSendMsg', convId })), false);
   const boxOrStatus = async (convId, needsOpen) => {
-    const box = await core.boxFor(convId, needsOpen);
+    let box = await core.boxFor(convId, needsOpen);
+    if (typeof box === 'string' && box === 'not-open') {
+      try { if (chat && typeof chat.open === 'function') await chat.open(convId); } catch {}
+      box = await core.boxFor(convId, false);
+    }
     return typeof box === 'string' ? { status: box } : box;
   };
   const SRC = () => M.sendSrc || { Photo: { CLICK_ICON_SEND_PHOTO: 301, SEND_FROM_SCREENSHOT: 309 }, File: { CLICK_ICON_SEND_FILE: 401 } };
@@ -278,6 +388,7 @@
       if (eexc !== undefined) named.subType = eexc;
       return named;
     });
+    safe(() => { box.cc.mouseOverChatInput = false; }, null);
     box.cc._uploadFile({ target: { files: list, value: '' }, conversation: Object.assign({}, box.info) });
   };
 
@@ -287,7 +398,7 @@
     return withScope(convId, async () => {
       const files = await picked;
       if (!files.length) return { status: 'cancelled' };
-      const box = await boxOrStatus(convId, true);
+      const box = await boxOrStatus(convId, false);
       if (box.status) return box;
       if (locked(convId)) return { status: 'locked', text: LOCKED_TEXT };
       uploadAsFiles(box, files);
@@ -297,21 +408,34 @@
   };
 
   // Photos the official photo button takes (`supportPhoto`) go its way; videos and anything else go as files, as on Zalo PC.
-  const sendMedia = (convId) => {
+  const sendMedia = (convId, caption) => {
     const picked = pickFiles();
     convId = String(convId);
+    const title = str(caption).trim();
     return withScope(convId, async () => {
       const files = await picked;
       if (!files.length) return { status: 'cancelled' };
-      const box = await boxOrStatus(convId, true);
+      const box = await boxOrStatus(convId, false);
       if (box.status) return box;
       if (locked(convId)) return { status: 'locked', text: LOCKED_TEXT };
       if (files.length > maxFiles()) { box.cc._notifySendTooManyFile(); return { status: 'invalid' }; }
       const exts = photoExts();
       const photos = files.filter((f) => exts.includes(extOf(f.name)));
       const others = files.filter((f) => !photos.includes(f));
-      if (photos.length) await box.cc._uploadImg({ target: { files: photos, value: '' } }, Object.assign({}, box.info), SRC().Photo.CLICK_ICON_SEND_PHOTO, false);
-      if (others.length) uploadAsFiles(box, others);
+      safe(() => { box.cc.mouseOverChatInput = false; }, null);
+      if (photos.length === 1 && !others.length && title) {
+        const targetConv = Object.assign({}, box.info);
+        const opts = { isPasted: false, isUploaded: true, withoutPreview: true, targetConv, title, sendSource: SRC().Photo.CLICK_ICON_SEND_PHOTO };
+        try {
+          await box.cc._uploadDragPhoto(photos[0], opts);
+        } catch (e) {
+          if (!e || !e.code) throw e;
+          safe(() => M.overlimit && M.overlimit.b({ [e.code]: [photos[0]] }, box.cc.windowId, box.cc._sendOverlimitPhoto.bind(box.cc, targetConv)), null);
+        }
+      } else {
+        if (photos.length) await box.cc._uploadImg({ target: { files: photos, value: '' } }, Object.assign({}, box.info), SRC().Photo.CLICK_ICON_SEND_PHOTO, false);
+        if (others.length) uploadAsFiles(box, others);
+      }
       diag(`media photos=${photos.length} files=${others.length}`);
       return { status: 'done' };
     });
@@ -319,6 +443,7 @@
 
   // One screenshot (the PNG Swift wrote from the clipboard) into `target`, as `onCaptureResponseAccept` / `_onCaptureResponseSend2Me` do.
   const sendShotTo = async (box, file, fromMe) => {
+    safe(() => { box.cc.mouseOverChatInput = false; }, null);
     const opts = { isPasted: false, isUploaded: true, withoutPreview: true, targetConv: Object.assign({}, box.info), sendSource: SRC().Photo.SEND_FROM_SCREENSHOT };
     if (fromMe) opts.isFromScreenshot = true;
     try {

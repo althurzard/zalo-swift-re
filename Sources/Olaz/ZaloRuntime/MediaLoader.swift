@@ -494,11 +494,15 @@ actor MediaLoader {
     // MARK: Local files
 
     /// Roots `file://` media may be read from: Olaz's data directory (the official client's
-    /// `ZaloDownloads`) and its caches.
+    /// `ZaloDownloads`), its caches, and temporary attachment/screenshot staging folders.
     nonisolated(unsafe) static var allowedLocalRoots: [String] = [
         ZaloPlatform.defaultUserData.resolvingSymlinksInPath().path,
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Olaz", isDirectory: true).resolvingSymlinksInPath().path,
+        FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("OlazAttachments", isDirectory: true).path,
+        FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("olaz-screenshots", isDirectory: true).path,
     ]
 
     /// SwiftZalo's data directory (before the move to Olaz). The migrated message database still points at files the
@@ -508,9 +512,27 @@ actor MediaLoader {
             .appendingPathComponent("SwiftZalo/ZaloData", isDirectory: true).resolvingSymlinksInPath().path,
     ]
 
-    /// A `file://` URL media may be read from: Olaz's own roots and the legacy one.
+    private nonisolated static let userPickedLock = NSLock()
+    private nonisolated(unsafe) static var userPickedLocalPaths: Set<String> = []
+
+    /// Marks a user-picked/dropped attachment file as readable by `MediaLoader` (never deletable by `isOwnLocalFile`).
+    nonisolated static func allowUserAttachment(_ url: URL) {
+        guard url.isFileURL else { return }
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        userPickedLock.lock()
+        if userPickedLocalPaths.count > 500 { userPickedLocalPaths.removeAll() }
+        userPickedLocalPaths.insert(path)
+        userPickedLock.unlock()
+    }
+
+    /// A `file://` URL media may be read from: Olaz's own roots, the legacy one, or a user-picked attachment.
     nonisolated static func isAllowedLocalFile(_ url: URL) -> Bool {
-        isLocalFile(url, under: allowedLocalRoots + legacyLocalRoots)
+        if isLocalFile(url, under: allowedLocalRoots + legacyLocalRoots) { return true }
+        guard url.isFileURL else { return false }
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        userPickedLock.lock()
+        defer { userPickedLock.unlock() }
+        return userPickedLocalPaths.contains(path)
     }
 
     /// A file Olaz may also delete (a corrupt download to fetch again): its own roots only.

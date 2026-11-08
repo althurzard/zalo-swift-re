@@ -128,6 +128,8 @@ final class ZaloEngine {
     var screenshotShare: ScreenshotShare?
     var screenCaptureNeedsPermission = false
     @ObservationIgnored internal var screenCaptureTool: ScreenCapture?
+    /// Images pasted with ⌘V, staged in the conversation's composer tray before sending.
+    var stagedImages: [String: [StagedImage]] = [:]
     /// Message context-menu actions (ZaloEngine+MessageActions.swift): the "Chia sẻ" picker, a confirm they ask, the undo of the last
     /// "Xóa chỉ ở phía tôi", the pinned list of the open conversation.
     var forwardRequest: ForwardRequest?

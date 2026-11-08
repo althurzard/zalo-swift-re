@@ -139,3 +139,178 @@ enum OlazAssets {
 extension EnvironmentValues {
     @Entry var olazTextScale: CGFloat = 1
 }
+
+/// Renders an SF Symbol into a square template `NSImage` whose drawn pixel bounding box (plus optical center adjustment
+/// for circular arrows, play triangles, and directional chevrons) sits at the exact center `(box / 2, box / 2)`, eliminating
+/// AppKit/SwiftUI `alignmentRect` baseline shifts and integer-point snapping inside circular buttons.
+struct CenteredSymbol: View {
+    let symbol: String
+    var size: CGFloat = 13
+    var weight: NSFont.Weight = .semibold
+    var box: CGFloat = 20
+
+    init(_ symbol: String, size: CGFloat = 13, weight: NSFont.Weight = .semibold, box: CGFloat = 20) {
+        self.symbol = symbol
+        self.size = size
+        self.weight = weight
+        self.box = box
+    }
+
+    var body: some View {
+        if let nsImage = Self.image(symbol: symbol, pointSize: size, weight: weight, box: box) {
+            Image(nsImage: nsImage)
+                .frame(width: box, height: box)
+                .contentTransition(.symbolEffect(.replace))
+        } else {
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: swiftUIWeight))
+                .frame(width: box, height: box)
+                .contentTransition(.symbolEffect(.replace))
+        }
+    }
+
+    private var swiftUIWeight: Font.Weight {
+        switch weight {
+        case .ultraLight: .ultraLight
+        case .thin: .thin
+        case .light: .light
+        case .regular: .regular
+        case .medium: .medium
+        case .semibold: .semibold
+        case .bold: .bold
+        case .heavy: .heavy
+        case .black: .black
+        default: .semibold
+        }
+    }
+
+    private struct CacheKey: Hashable {
+        let symbol: String
+        let pointSizeTenths: Int
+        let weightRaw: CGFloat
+        let boxTenths: Int
+    }
+
+    @MainActor private static var cache: [CacheKey: NSImage] = [:]
+
+    /// Optical shift in screen points (positive x = right, positive y = down) relative to the drawn pixel bounding box center.
+    static func opticalOffset(for symbol: String, pointSize: CGFloat) -> CGPoint {
+        let s = pointSize / 13.0
+        return switch symbol {
+        case "gobackward.5", "goforward.5", "gobackward.10", "goforward.10", "gobackward.15", "goforward.15":
+            // Top arrowhead at 12 o'clock protrudes above the circular ring; shifting up centers the ring and digit.
+            CGPoint(x: 0, y: -0.65 * s)
+        case "arrow.counterclockwise", "arrow.clockwise":
+            CGPoint(x: 0, y: -0.65 * s)
+        case "play.fill":
+            // Right-pointing triangle centroid sits at 1/3 width from left edge; shift right so centroid aligns with center.
+            CGPoint(x: 0.85 * s, y: 0)
+        case "chevron.left":
+            CGPoint(x: -0.4 * s, y: 0)
+        case "chevron.right":
+            CGPoint(x: 0.4 * s, y: 0)
+        case "chevron.down":
+            CGPoint(x: 0, y: 0.3 * s)
+        case "chevron.up":
+            CGPoint(x: 0, y: -0.3 * s)
+        default:
+            .zero
+        }
+    }
+
+    @MainActor static func image(symbol: String, pointSize: CGFloat, weight: NSFont.Weight = .semibold, box: CGFloat = 20) -> NSImage? {
+        let key = CacheKey(symbol: symbol, pointSizeTenths: Int((pointSize * 10).rounded()),
+                           weightRaw: weight.rawValue, boxTenths: Int((box * 10).rounded()))
+        if let cached = cache[key] { return cached }
+
+        let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+        guard let raw = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else {
+            return nil
+        }
+
+        let scale: CGFloat = 2.0
+        let pxSize = max(Int((box * scale).rounded()), 16)
+        let scratchPx = max(pxSize * 2, 96)
+
+        guard let scratch = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: scratchPx, pixelsHigh: scratchPx,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: scratchPx * 4, bitsPerPixel: 32
+        ), let ctx = NSGraphicsContext(bitmapImageRep: scratch) else { return nil }
+
+        let rawSize = raw.size
+        let baseOrigin = NSPoint(x: (CGFloat(scratchPx) / scale - rawSize.width) / 2.0,
+                                 y: (CGFloat(scratchPx) / scale - rawSize.height) / 2.0)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        ctx.cgContext.scaleBy(x: scale, y: scale)
+        raw.draw(in: NSRect(origin: baseOrigin, size: rawSize), from: .zero, operation: .sourceOver, fraction: 1.0)
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let ptr = scratch.bitmapData else { return nil }
+        let bpr = scratch.bytesPerRow
+        var minX = scratchPx, maxX = 0, minY = scratchPx, maxY = 0
+        for y in 0..<scratchPx {
+            for x in 0..<scratchPx {
+                if ptr[y * bpr + x * 4 + 3] > 38 {
+                    if x < minX { minX = x }
+                    if x > maxX { maxX = x }
+                    if y < minY { minY = y }
+                    if y > maxY { maxY = y }
+                }
+            }
+        }
+        guard minX <= maxX && minY <= maxY else { return raw }
+
+        let bboxCenterPtX = CGFloat(minX + maxX + 1) / 2.0 / scale
+        let bboxCenterFromTopPtY = CGFloat(minY + maxY + 1) / 2.0 / scale
+        let bboxCenterFromBottomPtY = CGFloat(scratchPx) / scale - bboxCenterFromTopPtY
+
+        let optical = opticalOffset(for: symbol, pointSize: pointSize)
+        let targetCenterPtX = box / 2.0 + optical.x
+        let targetCenterFromBottomPtY = box / 2.0 - optical.y
+        let finalOrigin = NSPoint(
+            x: baseOrigin.x + (targetCenterPtX - bboxCenterPtX),
+            y: baseOrigin.y + (targetCenterFromBottomPtY - bboxCenterFromBottomPtY)
+        )
+
+        guard let outRep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: pxSize, pixelsHigh: pxSize,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: pxSize * 4, bitsPerPixel: 32
+        ), let outCtx = NSGraphicsContext(bitmapImageRep: outRep) else { return nil }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = outCtx
+        outCtx.cgContext.scaleBy(x: scale, y: scale)
+        raw.draw(in: NSRect(origin: finalOrigin, size: rawSize), from: .zero, operation: .sourceOver, fraction: 1.0)
+        NSGraphicsContext.restoreGraphicsState()
+
+        let outImage = NSImage(size: NSSize(width: box, height: box))
+        outImage.addRepresentation(outRep)
+        outImage.isTemplate = true
+        cache[key] = outImage
+        return outImage
+    }
+
+    /// Returns the non-transparent pixel margins `(left, right, top, bottom)` of the rendered symbol bitmap for testing.
+    @MainActor static func pixelMargins(symbol: String, pointSize: CGFloat = 13, weight: NSFont.Weight = .semibold, box: CGFloat = 28) -> (left: Int, right: Int, top: Int, bottom: Int)? {
+        guard let img = image(symbol: symbol, pointSize: pointSize, weight: weight, box: box),
+              let rep = img.representations.compactMap({ $0 as? NSBitmapImageRep }).first,
+              let ptr = rep.bitmapData else { return nil }
+        let w = rep.pixelsWide, h = rep.pixelsHigh, bpr = rep.bytesPerRow
+        var minX = w, maxX = 0, minY = h, maxY = 0
+        for y in 0..<h {
+            for x in 0..<w {
+                if ptr[y * bpr + x * 4 + 3] > 38 {
+                    if x < minX { minX = x }
+                    if x > maxX { maxX = x }
+                    if y < minY { minY = y }
+                    if y > maxY { maxY = y }
+                }
+            }
+        }
+        guard minX <= maxX && minY <= maxY else { return nil }
+        return (left: minX, right: w - 1 - maxX, top: minY, bottom: h - 1 - maxY)
+    }
+}

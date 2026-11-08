@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AppKit
 @testable import Olaz
 
 /// The ZaloCap stdout framing (main.js "F58p"), composer outcome decoding and the reminder sheet's time chips.
@@ -67,5 +68,179 @@ struct ComposerTests {
         #expect(calendar.component(.hour, from: in30) == 23 && calendar.component(.minute, from: in30) == 20)
         let tomorrow = ReminderComposeSheet.time(for: .tomorrow9, from: now)
         #expect(calendar.component(.day, from: tomorrow) == 28 && calendar.component(.hour, from: tomorrow) == 9 && calendar.component(.minute, from: tomorrow) == 0)
+    }
+
+    @Test func clipboardPasteDistinguishesFinderFilesExcelSpreadsheetImageOnlyAndPlainText() throws {
+        // Create a small 24x24 test PNG image.
+        let image = NSImage(size: NSSize(width: 24, height: 24), flipped: false) { rect in
+            NSColor.systemBlue.setFill()
+            rect.fill()
+            return true
+        }
+        let png = try #require(ClipboardPasteContent.renderImageToPNG(image, opaqueWhiteBackground: true)?.data)
+
+        // 1. Excel / Numbers copy: both PNG/TIFF image and plain text on pasteboard -> .spreadsheetOrRichImageAndText
+        let excelPB = NSPasteboard.withUniqueName()
+        excelPB.clearContents()
+        excelPB.setData(png, forType: .png)
+        excelPB.setString("Hạng mục\tSố lượng\r\nTáo\t12", forType: .string)
+        let excelResult = ClipboardPasteContent.inspect(excelPB)
+        if case .spreadsheetOrRichImageAndText(let imageData, let size, let text) = excelResult {
+            #expect(!imageData.isEmpty)
+            #expect(size.width > 0 && size.height > 0)
+            #expect(text == "Hạng mục\tSố lượng\nTáo\t12")
+        } else {
+            Issue.record("Expected .spreadsheetOrRichImageAndText for Excel copy, got \(excelResult)")
+        }
+
+        // 2. Tabular spreadsheet copy without bitmap (e.g. Google Sheets / TSV table) -> synthesizes PNG and returns .spreadsheetOrRichImageAndText
+        let sheetsPB = NSPasteboard.withUniqueName()
+        sheetsPB.clearContents()
+        sheetsPB.setString("Cột A\tCột B\nGiá trị 1\tGiá trị 2", forType: .string)
+        let sheetsResult = ClipboardPasteContent.inspect(sheetsPB)
+        if case .spreadsheetOrRichImageAndText(let imageData, let size, let text) = sheetsResult {
+            #expect(!imageData.isEmpty)
+            #expect(size.width >= 100 && size.height >= 40)
+            #expect(text == "Cột A\tCột B\nGiá trị 1\tGiá trị 2")
+        } else {
+            Issue.record("Expected .spreadsheetOrRichImageAndText for tabular TSV copy, got \(sheetsResult)")
+        }
+
+        // 3. Screenshot / image-only copy -> .imageOnly
+        let shotPB = NSPasteboard.withUniqueName()
+        shotPB.clearContents()
+        shotPB.setData(png, forType: .png)
+        let shotResult = ClipboardPasteContent.inspect(shotPB)
+        if case .imageOnly(let imageData, let size) = shotResult {
+            #expect(!imageData.isEmpty)
+            #expect(size.width > 0 && size.height > 0)
+        } else {
+            Issue.record("Expected .imageOnly for screenshot copy, got \(shotResult)")
+        }
+
+        // 4. Finder file copy (writes .fileURL + icon image + filename text) -> .files (must NOT be mistaken for Excel!)
+        let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-test-\(UUID().uuidString).txt")
+        try Data("hello".utf8).write(to: tempFile)
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        let finderPB = NSPasteboard.withUniqueName()
+        finderPB.clearContents()
+        finderPB.writeObjects([tempFile as NSURL])
+        finderPB.setData(png, forType: .tiff)
+        finderPB.setString(tempFile.lastPathComponent, forType: .string)
+        let finderResult = ClipboardPasteContent.inspect(finderPB)
+        #expect(finderResult == .files([tempFile]))
+
+        // 5. Plain text copy -> .plainText
+        let textPB = NSPasteboard.withUniqueName()
+        textPB.clearContents()
+        textPB.setString("Xin chào buổi tối", forType: .string)
+        #expect(ClipboardPasteContent.inspect(textPB) == .plainText("Xin chào buổi tối"))
+    }
+
+    @Test func prepareAttachmentURLsZipsDirectoriesAutomatically() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent("OlazTestFolder-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: folder) }
+
+        let innerFile = folder.appendingPathComponent("note.txt")
+        try Data("inside folder".utf8).write(to: innerFile)
+
+        let prepared = ZaloEngine.prepareAttachmentURLs([folder])
+        #expect(prepared.count == 1)
+        let zipURL = try #require(prepared.first)
+        #expect(zipURL.pathExtension.lowercased() == "zip")
+        #expect(fm.fileExists(atPath: zipURL.path))
+    }
+
+    @Test func browserCopyImageAndRaycastHistoryStayImageOnlyAndValidatePasteMenu() throws {
+        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
+            NSColor.systemGreen.setFill()
+            rect.fill()
+            return true
+        }
+        let png = try #require(ClipboardPasteContent.renderImageToPNG(image, opaqueWhiteBackground: true)?.data)
+
+        // 1. Safari / Chrome "Copy Image" places both `.png` and a single-line URL `.string` on NSPasteboard -> must stay `.imageOnly`
+        let browserPB = NSPasteboard.withUniqueName()
+        browserPB.clearContents()
+        browserPB.setData(png, forType: .png)
+        browserPB.setString("https://example.com/photo.png", forType: .string)
+        if case .imageOnly(let data, _) = ClipboardPasteContent.inspect(browserPB) {
+            #expect(!data.isEmpty)
+        } else {
+            Issue.record("Expected .imageOnly for browser Copy Image with URL string")
+        }
+
+        // 2. Raycast Clipboard History places `.png`, `com.raycast.RestoredType`, and a temporary `.fileURL` -> must extract `.imageOnly`
+        let tempCache = FileManager.default.temporaryDirectory.appendingPathComponent("raycast-\(UUID().uuidString).png")
+        try png.write(to: tempCache)
+        defer { try? FileManager.default.removeItem(at: tempCache) }
+
+        let raycastPB = NSPasteboard.withUniqueName()
+        raycastPB.clearContents()
+        raycastPB.declareTypes([
+            .png,
+            NSPasteboard.PasteboardType("com.raycast.RestoredType"),
+            .fileURL
+        ], owner: nil)
+        raycastPB.setData(png, forType: .png)
+        raycastPB.setData(Data(), forType: NSPasteboard.PasteboardType("com.raycast.RestoredType"))
+        raycastPB.setString(tempCache.absoluteString, forType: .fileURL)
+        if case .imageOnly(let data, _) = ClipboardPasteContent.inspect(raycastPB) {
+            #expect(!data.isEmpty)
+        } else {
+            Issue.record("Expected .imageOnly for Raycast restored image")
+        }
+
+        // 3. Single-cell Excel copy (image + HTML table marker) -> `.spreadsheetOrRichImageAndText`
+        let singleCellExcelPB = NSPasteboard.withUniqueName()
+        singleCellExcelPB.clearContents()
+        singleCellExcelPB.setData(png, forType: .png)
+        singleCellExcelPB.setString("<table><tr><td>42</td></tr></table>", forType: NSPasteboard.PasteboardType("public.html"))
+        singleCellExcelPB.setString("42", forType: .string)
+        if case .spreadsheetOrRichImageAndText = ClipboardPasteContent.inspect(singleCellExcelPB) {
+            // ok
+        } else {
+            Issue.record("Expected .spreadsheetOrRichImageAndText for HTML table Excel copy")
+        }
+
+        // 4. FieldTextView readablePasteboardTypes and hasPasteableContent support image-only pasteboards (no .string)
+        let imageOnlyPB = NSPasteboard.withUniqueName()
+        imageOnlyPB.clearContents()
+        imageOnlyPB.setData(png, forType: .png)
+        #expect(ClipboardPasteContent.hasPasteableContent(imageOnlyPB))
+
+        let tv = ComposerTextView.FieldTextView()
+        tv.isRichText = false
+        tv.importsGraphics = false
+        #expect(tv.readablePasteboardTypes.contains(.png))
+        #expect(tv.readablePasteboardTypes.contains(.tiff))
+        #expect(tv.readablePasteboardTypes.contains(.fileURL))
+    }
+
+    @MainActor @Test func stagedImagesStageRemoveAndTakePerConversation() {
+        let engine = ZaloEngine()
+        let first = NSImage(size: NSSize(width: 4, height: 4))
+        let second = NSImage(size: NSSize(width: 8, height: 8))
+        engine.stageImages([first, second], in: "conv-1")
+        #expect(engine.stagedImages["conv-1"]?.count == 2)
+        #expect(engine.stagedImages["conv-2"] == nil)
+
+        if let firstId = engine.stagedImages["conv-1"]?.first?.id {
+            engine.removeStagedImage(firstId, in: "conv-1")
+        }
+        #expect(engine.stagedImages["conv-1"]?.count == 1)
+
+        let taken = engine.takeStagedImages(for: "conv-1")
+        #expect(taken.count == 1)
+        #expect(engine.stagedImages["conv-1"] == nil)
+
+        engine.restoreStagedImages(taken, in: "conv-1")
+        #expect(engine.stagedImages["conv-1"]?.count == 1)
+
+        engine.clearStagedImages(in: "conv-1")
+        #expect(engine.stagedImages["conv-1"] == nil)
     }
 }

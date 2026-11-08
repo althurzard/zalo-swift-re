@@ -26,11 +26,13 @@ struct ChatComposer: View {
     @State private var selected = 0
     @State private var showPollCreate = false
     @State private var showStickers = false
-    /// "Ảnh hoặc Video" / "Tệp": the open panel and what its pick is sent as.
-    @State private var importing = false
-    @State private var importKind = AttachmentKind.files
     @State private var showMyCard = false
     @State private var reminderInfo: ReminderComposeInfo?
+    @State private var spreadsheetPaste: SpreadsheetPastePayload?
+    @State private var isDropTargeted = false
+    @State private var uploadingCount = 0
+    @State private var pasteMonitor: Any?
+    @State private var lastPasteGuard: (changeCount: Int, time: TimeInterval)?
 
     private enum AttachmentKind { case media, files }
     /// Stickers suggested for the draft (official suggestion logic); they show only while the draft still is the text they were found for.
@@ -42,7 +44,8 @@ struct ChatComposer: View {
         typingStickers.isVisible(draft: draft, mentionListOpen: suggestionsOpen, settingEnabled: StickerSuggestState.shared.setting?.enabled)
     }
 
-    private var isEmpty: Bool { draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var staged: [StagedImage] { engine.stagedImages[conversationId] ?? [] }
+    private var isEmpty: Bool { draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && staged.isEmpty }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -52,6 +55,18 @@ struct ChatComposer: View {
                     Text("\(typingName) đang soạn tin…")
                 }
                 .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 11).padding(.vertical, 4)
+                .glassEffect(.regular, in: Capsule())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity)
+            }
+            if uploadingCount > 0 {
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.mini)
+                    Text("Đang gửi tệp đính kèm…")
+                }
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 11).padding(.vertical, 4)
                 .glassEffect(.regular, in: Capsule())
@@ -74,6 +89,14 @@ struct ChatComposer: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            if !staged.isEmpty {
+                StagedImageStrip(
+                    images: staged,
+                    remove: { engine.removeStagedImage($0, in: conversationId) },
+                    clearAll: { engine.clearStagedImages(in: conversationId) }
+                )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             if suggestionsOpen {
@@ -103,8 +126,21 @@ struct ChatComposer: View {
         .animation(.snappy(duration: 0.18), value: suggestionsOpen)
         .animation(.snappy(duration: 0.18), value: stickerStripOpen)
         .animation(.snappy(duration: 0.18), value: replyTo?.id)
+        .animation(.snappy(duration: 0.18), value: staged.map(\.id))
         .animation(.snappy(duration: 0.18), value: typingName)
-        .onAppear { ComposerTextView.accent = NSColor(ChatPalette.accent(accentStored)) }
+        .animation(.snappy(duration: 0.18), value: uploadingCount > 0)
+        .onChange(of: staged.count) { old, now in if now > old { handle.focus() } }
+        .onAppear {
+            ComposerTextView.accent = NSColor(ChatPalette.accent(accentStored))
+            handle.conversationId = conversationId
+            installPasteKeyMonitor()
+        }
+        .onChange(of: conversationId) { _, now in
+            handle.conversationId = now
+        }
+        .onDisappear {
+            removePasteKeyMonitor()
+        }
         .onChange(of: accentStored) { _, now in ComposerTextView.accent = NSColor(ChatPalette.accent(now)) }
         .task(id: query) { await loadCandidates() }
         .task(id: draft) { await loadStickerSuggestions() }
@@ -114,10 +150,23 @@ struct ChatComposer: View {
         .sheet(isPresented: Binding(get: { reminderInfo != nil }, set: { if !$0 { reminderInfo = nil } })) {
             if let reminderInfo { ReminderComposeSheet(conversationId: conversationId, info: reminderInfo) }
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: importKind == .media ? [.image, .movie] : [.data],
-                      allowsMultipleSelection: true) { result in
-            guard case .success(let urls) = result, !urls.isEmpty else { return }
-            sendAttachments(urls, as: importKind)
+        .sheet(item: $spreadsheetPaste) { payload in
+            SpreadsheetPasteChoiceSheet(
+                conversationId: conversationId,
+                conversationName: name,
+                payload: payload,
+                onInsertTextToDraft: { inserted in
+                    if handle.textView != nil {
+                        handle.insertPlainText(inserted)
+                    } else {
+                        draft = draft.isEmpty ? inserted : draft + "\n" + inserted
+                    }
+                },
+                onSent: {}
+            )
+        }
+        .onDrop(of: [.fileURL, .png, .tiff, .pdf, .image], isTargeted: $isDropTargeted) { providers in
+            engine.handleDroppedProviders(providers, in: conversationId)
         }
     }
 
@@ -128,8 +177,8 @@ struct ChatComposer: View {
     private var plusMenu: some View {
         Menu {
             if !conversationId.isEmpty {
-                Button("Ảnh hoặc Video", systemImage: "photo.on.rectangle") { importKind = .media; importing = true }
-                Button("Tệp", systemImage: "paperclip") { importKind = .files; importing = true }
+                Button("Ảnh hoặc Video", systemImage: "photo.on.rectangle") { pickAttachments(as: .media) }
+                Button("Tệp", systemImage: "paperclip") { pickAttachments(as: .files) }
                 Menu("Chụp màn hình", systemImage: "camera.viewfinder") {
                     Button("Chụp kèm cửa sổ \(AppBrand.name)") { engine.startScreenCapture(in: conversationId, withOlaz: true) }
                     Button("Chụp không kèm cửa sổ \(AppBrand.name)") { engine.startScreenCapture(in: conversationId, withOlaz: false) }
@@ -147,7 +196,7 @@ struct ChatComposer: View {
             Button("Emoji", systemImage: "face.smiling") { NSApp.orderFrontCharacterPalette(nil) }
         } label: {
             // Drawn like the send disc: a glass-styled Menu renders an extra pull-down segment beside the button.
-            Image(systemName: "plus").font(.system(size: 16, weight: .semibold))
+            CenteredSymbol("plus", size: 16, weight: .semibold, box: 22)
                 .frame(width: 36, height: 36)
                 .contentShape(Circle())
                 .glassEffect(.regular.interactive(), in: Circle())
@@ -168,6 +217,8 @@ struct ChatComposer: View {
                 handle: handle, mentionsEnabled: isGroup,
                 onMentionQuery: { query = $0 },
                 onSuggestionKey: suggestionKey,
+                onPasteboardAction: handlePasteboard,
+                onDropTargetChange: { isDropTargeted = $0 },
                 onSend: send)
                 .frame(height: textHeight)
                 .overlay(alignment: .topLeading) {
@@ -199,6 +250,12 @@ struct ChatComposer: View {
             }
         }
         .padding(.leading, 14).padding(.trailing, 6)
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 19, style: .continuous)
+                    .strokeBorder(.tint, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+            }
+        }
         .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
     }
 
@@ -216,7 +273,7 @@ struct ChatComposer: View {
                 .accessibilityLabel("Gửi biểu tượng thích")
             } else {
                 Button(action: send) {
-                    Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold)).foregroundStyle(.white)
+                    CenteredSymbol("arrow.up", size: 15, weight: .bold, box: 22).foregroundStyle(.white)
                         .frame(width: 36, height: 36).contentShape(Circle())
                 }
                 .buttonStyle(.plain)
@@ -231,11 +288,127 @@ struct ChatComposer: View {
 
     // MARK: Attachments, reminder
 
+    private func pickAttachments(as kind: AttachmentKind) {
+        guard !conversationId.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        switch kind {
+        case .media:
+            panel.title = "Chọn Ảnh hoặc Video"
+            panel.canChooseDirectories = false
+            panel.allowedContentTypes = [.image, .movie]
+        case .files:
+            panel.title = "Chọn Tệp hoặc Thư mục"
+            panel.canChooseDirectories = true
+            panel.treatsFilePackagesAsDirectories = false
+            panel.allowedContentTypes = [.item]
+        }
+        if panel.runModal() == .OK, !panel.urls.isEmpty {
+            sendAttachments(panel.urls, as: kind)
+        }
+    }
+
+    private func installPasteKeyMonitor() {
+        guard pasteMonitor == nil else { return }
+        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isPasteShortcut = (flags == .command || flags == [.command, .shift])
+                && (event.keyCode == 9 || event.charactersIgnoringModifiers?.lowercased() == "v")
+            let activeConvId = handle.conversationId.isEmpty ? conversationId : handle.conversationId
+            guard isPasteShortcut, !activeConvId.isEmpty else { return event }
+            guard !showPollCreate, !showMyCard, reminderInfo == nil, spreadsheetPaste == nil else { return event }
+            guard let window = handle.textView?.window ?? NSApp.keyWindow,
+                  window.isKeyWindow,
+                  window.attachedSheet == nil,
+                  engine.composerConfirm == nil,
+                  engine.screenshotShare == nil else { return event }
+
+            // Do not hijack ⌘V when the user is editing another text field (e.g. sidebar search or quick switcher).
+            if let responderTV = window.firstResponder as? NSTextView,
+               responderTV !== handle.textView,
+               responderTV.isEditable {
+                return event
+            }
+
+            if handlePasteboard(NSPasteboard.general, isDrop: false, targetConversationId: activeConvId) {
+                return nil
+            }
+
+            // If focus was outside FieldTextView (e.g. conversation list or message list) and the clipboard holds plain text,
+            // focus the composer and insert the text directly.
+            if window.firstResponder !== handle.textView,
+               let plain = NSPasteboard.general.string(forType: .string),
+               !plain.isEmpty {
+                if handle.textView != nil {
+                    handle.insertPlainText(plain)
+                } else {
+                    draft += plain
+                }
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removePasteKeyMonitor() {
+        if let monitor = pasteMonitor {
+            NSEvent.removeMonitor(monitor)
+            pasteMonitor = nil
+        }
+    }
+
+    private func handlePasteboard(_ pasteboard: NSPasteboard, isDrop: Bool) -> Bool {
+        let activeConvId = handle.conversationId.isEmpty ? conversationId : handle.conversationId
+        return handlePasteboard(pasteboard, isDrop: isDrop, targetConversationId: activeConvId)
+    }
+
+    private func handlePasteboard(_ pasteboard: NSPasteboard, isDrop: Bool, targetConversationId: String) -> Bool {
+        guard !targetConversationId.isEmpty else { return false }
+        if !isDrop {
+            let now = Date().timeIntervalSinceReferenceDate
+            let cc = pasteboard.changeCount
+            if let guardEntry = lastPasteGuard, guardEntry.changeCount == cc, now - guardEntry.time < 0.15 {
+                return true
+            }
+        }
+        let inspected = ClipboardPasteContent.inspect(pasteboard)
+        switch inspected {
+        case .files(let urls):
+            if !isDrop { lastPasteGuard = (pasteboard.changeCount, Date().timeIntervalSinceReferenceDate) }
+            EngineLog.shared.write("pasteboard \(isDrop ? "drop" : "paste") → files(\(urls.count))")
+            sendAttachments(urls, as: .media, to: targetConversationId)
+            return true
+        case .spreadsheetOrRichImageAndText(let imageData, let imageSize, let text):
+            if !isDrop { lastPasteGuard = (pasteboard.changeCount, Date().timeIntervalSinceReferenceDate) }
+            EngineLog.shared.write("pasteboard \(isDrop ? "drop" : "paste") → spreadsheet(\(imageData.count)B)")
+            spreadsheetPaste = SpreadsheetPastePayload(imageData: imageData, imageSize: imageSize, text: text)
+            return true
+        case .imageOnly(let imageData, _):
+            if let fileURL = ZaloEngine.writeTemporaryPasteImage(imageData, prefix: isDrop ? "dropped-image" : "clipboard") {
+                if !isDrop { lastPasteGuard = (pasteboard.changeCount, Date().timeIntervalSinceReferenceDate) }
+                EngineLog.shared.write("pasteboard \(isDrop ? "drop" : "paste") → image(\(imageData.count)B)")
+                if isDrop {
+                    sendAttachments([fileURL], as: .media, to: targetConversationId)
+                } else {
+                    engine.stageImageFile(fileURL, image: NSImage(data: imageData), in: targetConversationId)
+                    handle.focus()
+                }
+                return true
+            }
+            return false
+        case .plainText, .empty:
+            return false
+        }
+    }
+
     /// The picked files go to the conversation they were picked in, even if another one is open by the time they are sent.
-    private func sendAttachments(_ urls: [URL], as kind: AttachmentKind) {
-        let target = conversationId
+    private func sendAttachments(_ urls: [URL], as kind: AttachmentKind, to overrideTarget: String? = nil) {
+        let target = overrideTarget ?? (handle.conversationId.isEmpty ? conversationId : handle.conversationId)
         guard !target.isEmpty else { return }
+        uploadingCount += 1
         Task {
+            defer { uploadingCount = max(0, uploadingCount - 1) }
             let outcome = kind == .media ? await engine.sendMedia(urls, to: target) : await engine.sendFiles(urls, to: target)
             engine.report(outcome, in: target)
         }
@@ -433,10 +606,11 @@ private struct MentionSuggestions: View {
     }
 }
 
-/// Lets SwiftUI insert a chosen mention into the NSTextView.
+/// Lets SwiftUI insert a chosen mention or pasted plain text into the NSTextView.
 @MainActor
 final class ComposerHandle {
     weak var textView: NSTextView?
+    var conversationId: String = ""
 
     func insertMention(_ candidate: MentionCandidate, replacing range: NSRange) {
         guard let tv = textView, let storage = tv.textStorage,
@@ -451,6 +625,90 @@ final class ComposerHandle {
         tv.didChangeText()
         tv.setSelectedRange(NSRange(location: range.location + inserted.length, length: 0))
         tv.window?.makeFirstResponder(tv)
+    }
+
+    func focus() {
+        guard let tv = textView else { return }
+        tv.window?.makeFirstResponder(tv)
+    }
+
+    func insertPlainText(_ text: String) {
+        guard let tv = textView, let storage = tv.textStorage else { return }
+        let sel = tv.selectedRange()
+        let start = min(max(0, sel.location), storage.length)
+        let len = min(max(0, sel.length), max(0, storage.length - start))
+        let range = NSRange(location: start, length: len)
+        let inserted = NSAttributedString(string: text, attributes: ComposerTextView.baseAttributes)
+        guard tv.shouldChangeText(in: range, replacementString: inserted.string) else { return }
+        storage.replaceCharacters(in: range, with: inserted)
+        tv.didChangeText()
+        tv.setSelectedRange(NSRange(location: range.location + inserted.length, length: 0))
+        tv.window?.makeFirstResponder(tv)
+    }
+}
+
+/// Inline preview strip inside `ChatComposer` for images pasted with ⌘V.
+struct StagedImageStrip: View {
+    let images: [StagedImage]
+    let remove: (UUID) -> Void
+    let clearAll: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.tint)
+                Text("Đính kèm \(images.count) ảnh")
+                    .font(.system(size: 11.5, weight: .semibold))
+                Text("• Nhấn Enter để gửi kèm tin nhắn")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Button(images.count > 1 ? "Xóa tất cả" : "Xóa", systemImage: "xmark", action: clearAll)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help(images.count > 1 ? "Xóa tất cả ảnh đính kèm" : "Xóa ảnh đính kèm")
+            }
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    ForEach(Array(images.enumerated()), id: \.element.id) { index, item in
+                        ZStack(alignment: .topTrailing) {
+                            Image(nsImage: item.image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 68, height: 68)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                                )
+                                .accessibilityLabel("Ảnh đính kèm \(index + 1)")
+                            Button {
+                                remove(item.id)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 15))
+                                    .symbolRenderingMode(.palette)
+                                    .foregroundStyle(.white, .black.opacity(0.65))
+                            }
+                            .buttonStyle(.plain)
+                            .offset(x: 4, y: -4)
+                            .help("Bỏ ảnh này")
+                            .accessibilityLabel("Bỏ ảnh \(index + 1)")
+                        }
+                        .padding(.top, 4)
+                        .padding(.trailing, 4)
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -481,6 +739,9 @@ struct ComposerTextView: NSViewRepresentable {
     var onMentionQuery: (MentionQuery?) -> Void = { _ in }
     /// While the popover is open: ↑ ↓ Return/Tab Esc. Returns true when consumed.
     var onSuggestionKey: (MentionKey) -> Bool = { _ in false }
+    /// Handles pasteboard attachments/spreadsheets on `⌘V` or drag-and-drop; returns `true` when consumed.
+    var onPasteboardAction: (NSPasteboard, Bool) -> Bool = { _, _ in false }
+    var onDropTargetChange: (Bool) -> Void = { _ in }
     var onSend: () -> Void
 
     static let font = NSFont.systemFont(ofSize: 14)
@@ -535,6 +796,12 @@ struct ComposerTextView: NSViewRepresentable {
         tv.onWidthChange = { [weak coordinator = context.coordinator, weak tv] in
             guard let tv else { return }
             coordinator?.remeasure(tv)
+        }
+        tv.onPasteboardAction = { [weak coordinator = context.coordinator] pb, isDrop in
+            coordinator?.parent.onPasteboardAction(pb, isDrop) ?? false
+        }
+        tv.onDropTargetChange = { [weak coordinator = context.coordinator] targeted in
+            coordinator?.parent.onDropTargetChange(targeted)
         }
 
         let scroll = NSScrollView()
@@ -748,10 +1015,112 @@ struct ComposerTextView: NSViewRepresentable {
 
     final class FieldTextView: NSTextView {
         var onWidthChange: (() -> Void)?
+        var onPasteboardAction: ((NSPasteboard, Bool) -> Bool)?
+        var onDropTargetChange: ((Bool) -> Void)?
+
+        override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+            var types = super.readablePasteboardTypes
+            let extra = ClipboardPasteContent.supportedImagePasteboardTypes + [
+                .fileURL,
+                .tabularText,
+                NSPasteboard.PasteboardType("public.html")
+            ]
+            for type in extra where !types.contains(type) {
+                types.append(type)
+            }
+            return types
+        }
+
+        override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+            if item.action == #selector(NSText.paste(_:))
+                || item.action == #selector(NSTextView.pasteAsPlainText(_:))
+                || item.action == #selector(NSTextView.pasteAsRichText(_:)) {
+                return isEditable && ClipboardPasteContent.hasPasteableContent(NSPasteboard.general)
+            }
+            return super.validateUserInterfaceItem(item)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window, window.attachedSheet == nil else { return }
+            if let responderTV = window.firstResponder as? NSTextView, responderTV.isEditable { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let win = self.window, win.attachedSheet == nil else { return }
+                if let responderTV = win.firstResponder as? NSTextView, responderTV.isEditable { return }
+                win.makeFirstResponder(self)
+            }
+        }
+
         override func setFrameSize(_ newSize: NSSize) {
             let changed = abs(newSize.width - frame.width) > 0.5
             super.setFrameSize(newSize)
             if changed { DispatchQueue.main.async { [weak self] in self?.onWidthChange?() } }
+        }
+
+        override func paste(_ sender: Any?) {
+            if onPasteboardAction?(NSPasteboard.general, false) == true {
+                return
+            }
+            super.pasteAsPlainText(sender)
+        }
+
+        override func pasteAsPlainText(_ sender: Any?) {
+            if onPasteboardAction?(NSPasteboard.general, false) == true {
+                return
+            }
+            super.pasteAsPlainText(sender)
+        }
+
+        override func pasteAsRichText(_ sender: Any?) {
+            if onPasteboardAction?(NSPasteboard.general, false) == true {
+                return
+            }
+            super.pasteAsPlainText(sender)
+        }
+
+        private func hasAttachmentInDrag(_ sender: NSDraggingInfo) -> Bool {
+            let pb = sender.draggingPasteboard
+            if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+               urls.contains(where: { $0.isFileURL }) {
+                return true
+            }
+            if pb.availableType(from: ClipboardPasteContent.supportedImagePasteboardTypes) != nil {
+                return true
+            }
+            return false
+        }
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            if hasAttachmentInDrag(sender) {
+                onDropTargetChange?(true)
+                return .copy
+            }
+            return super.draggingEntered(sender)
+        }
+
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            if hasAttachmentInDrag(sender) {
+                return .copy
+            }
+            return super.draggingUpdated(sender)
+        }
+
+        override func draggingExited(_ sender: NSDraggingInfo?) {
+            onDropTargetChange?(false)
+            super.draggingExited(sender)
+        }
+
+        override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+            onDropTargetChange?(false)
+            super.concludeDragOperation(sender)
+        }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            onDropTargetChange?(false)
+            if hasAttachmentInDrag(sender) {
+                return onPasteboardAction?(sender.draggingPasteboard, true) ?? false
+            }
+            return super.performDragOperation(sender)
         }
     }
 }

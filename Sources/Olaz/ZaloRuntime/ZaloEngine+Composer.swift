@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 // Composer "+" actions — Ảnh hoặc Video, Tệp, Chụp màn hình, Danh thiếp, Nhắc hẹn — bridged to `HostScripts/composer-adapter.js`
 // (`window.__zaloCompose`). Picked files reach the page as browser `File`s: the adapter clicks a hidden file input and
@@ -59,6 +60,23 @@ struct ScreenshotShare: Identifiable, Equatable {
     var image: URL?
     var text: String?
     var conversationId: String
+}
+
+/// An image pasted with ⌘V waiting in the conversation's composer tray (`StagedImageStrip`) to be sent with an optional caption.
+struct StagedImage: Identifiable, Equatable {
+    let id: UUID
+    let image: NSImage
+    let fileURL: URL
+
+    init(id: UUID = UUID(), image: NSImage, fileURL: URL) {
+        self.id = id
+        self.image = image
+        self.fileURL = fileURL
+    }
+
+    static func == (lhs: StagedImage, rhs: StagedImage) -> Bool {
+        lhs.id == rhs.id && lhs.fileURL == rhs.fileURL
+    }
 }
 
 /// My own contact card as the official "Gửi danh thiếp" modal would send it.
@@ -128,16 +146,210 @@ enum ReminderRepeat: Int, CaseIterable, Identifiable {
 }
 
 extension ZaloEngine {
+    static let maxStagedImages = 50
+
     // MARK: Attachments
 
     /// "Ảnh hoặc Video": photos through the official photo button's path, videos and other files as files.
-    func sendMedia(_ urls: [URL], to id: String) async -> ComposerOutcome {
-        await composeWithFiles("sendMedia", [id], files: urls)
+    func sendMedia(_ urls: [URL], to id: String, caption: String? = nil) async -> ComposerOutcome {
+        let prepared = Self.prepareAttachmentURLs(urls, convertUnsupportedPhotos: true)
+        let trimmed = caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let args: [Any] = trimmed.isEmpty ? [id] : [id, trimmed]
+        return await composeWithFiles("sendMedia", args, files: prepared)
+    }
+
+    func stageImageFile(_ fileURL: URL, image: NSImage? = nil, in id: String) {
+        guard !id.isEmpty else { return }
+        var current = stagedImages[id] ?? []
+        guard current.count < Self.maxStagedImages else {
+            CardActionCenter.shared.show("Chỉ gửi được tối đa \(Self.maxStagedImages) ảnh mỗi lần.", in: id)
+            return
+        }
+        guard let resolvedImage = image ?? NSImage(contentsOf: fileURL) else { return }
+        let resolvedURL = fileURL.resolvingSymlinksInPath()
+        MediaLoader.allowUserAttachment(resolvedURL)
+        current.append(StagedImage(image: resolvedImage, fileURL: resolvedURL))
+        stagedImages[id] = current
+    }
+
+    func stageImages(_ images: [NSImage], in id: String) {
+        guard !id.isEmpty, !images.isEmpty else { return }
+        var current = stagedImages[id] ?? []
+        let remaining = max(0, Self.maxStagedImages - current.count)
+        guard remaining > 0 else {
+            CardActionCenter.shared.show("Chỉ gửi được tối đa \(Self.maxStagedImages) ảnh mỗi lần.", in: id)
+            return
+        }
+        for img in images.prefix(remaining) {
+            let pngData = ClipboardPasteContent.renderImageToPNG(img, opaqueWhiteBackground: false)?.data
+                ?? img.tiffRepresentation.flatMap { NSBitmapImageRep(data: $0)?.representation(using: .png, properties: [:]) }
+            let fileURL = pngData.flatMap { Self.writeTemporaryPasteImage($0, prefix: "clipboard") }
+                ?? FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+                    .appendingPathComponent("OlazAttachments/staged-\(UUID().uuidString).png")
+            MediaLoader.allowUserAttachment(fileURL)
+            current.append(StagedImage(image: img, fileURL: fileURL))
+        }
+        stagedImages[id] = current
+    }
+
+    func removeStagedImage(_ itemId: UUID, in id: String) {
+        guard var current = stagedImages[id] else { return }
+        current.removeAll { $0.id == itemId }
+        stagedImages[id] = current.isEmpty ? nil : current
+    }
+
+    func clearStagedImages(in id: String) {
+        stagedImages[id] = nil
+    }
+
+    func takeStagedImages(for id: String) -> [StagedImage] {
+        stagedImages.removeValue(forKey: id) ?? []
+    }
+
+    func restoreStagedImages(_ items: [StagedImage], in id: String) {
+        guard !id.isEmpty, !items.isEmpty else { return }
+        let existing = stagedImages[id] ?? []
+        stagedImages[id] = Array((items + existing).prefix(Self.maxStagedImages))
     }
 
     /// "Tệp": the official file button's path.
     func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
-        await composeWithFiles("sendFiles", [id], files: urls)
+        let prepared = Self.prepareAttachmentURLs(urls, convertUnsupportedPhotos: false)
+        return await composeWithFiles("sendFiles", [id], files: prepared)
+    }
+
+    /// Prepares picked, dropped, or pasted file/directory URLs for WebKit's `<input type=file>`:
+    /// - Directories and macOS packages (`.app`, `.bundle`, folders) are compressed into a temporary `.zip` archive via `ditto`
+    ///   because browser `FileReader` cannot read raw directories.
+    /// - When `convertUnsupportedPhotos` is true, macOS raster image formats outside Zalo's web `supportPhoto` list
+    ///   (`.heic`, `.heif`, `.tiff`, `.tif`, `.bmp`) are converted to `.png` so they send as inline photo messages.
+    static func prepareAttachmentURLs(_ urls: [URL], convertUnsupportedPhotos: Bool = true) -> [URL] {
+        let fm = FileManager.default
+        let convertExts: Set<String> = ["heic", "heif", "tiff", "tif", "bmp"]
+        var out: [URL] = []
+        for url in urls where url.isFileURL {
+            guard fm.fileExists(atPath: url.path) else { continue }
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+            if values?.isDirectory == true || values?.isPackage == true {
+                if let zipped = zipDirectoryForAttachment(url) {
+                    out.append(zipped)
+                }
+                continue
+            }
+            let ext = url.pathExtension.lowercased()
+            if convertUnsupportedPhotos, convertExts.contains(ext),
+               let image = NSImage(contentsOf: url),
+               let tiff = image.tiffRepresentation,
+               let rep = NSBitmapImageRep(data: tiff),
+               let png = rep.representation(using: .png, properties: [:]) {
+                let stem = url.deletingPathExtension().lastPathComponent
+                if let converted = writeTemporaryPasteImage(png, prefix: stem.isEmpty ? "photo" : stem) {
+                    out.append(converted)
+                    continue
+                }
+            }
+            let resolved = url.resolvingSymlinksInPath()
+            MediaLoader.allowUserAttachment(resolved)
+            out.append(resolved)
+        }
+        return out
+    }
+
+    /// Writes PNG image data (from clipboard paste, Excel table render, or drag-and-drop) to a temporary `.png` file.
+    static func writeTemporaryPasteImage(_ pngData: Data, prefix: String = "clipboard") -> URL? {
+        guard !pngData.isEmpty else { return nil }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("OlazAttachments", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let safePrefix = prefix.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        let stamp = Int((Date().timeIntervalSince1970 * 1000).rounded())
+        let fileURL = dir.appendingPathComponent("\(safePrefix)-\(stamp)-\(UUID().uuidString.prefix(6)).png")
+        do {
+            try pngData.write(to: fileURL, options: .atomic)
+            return fileURL.resolvingSymlinksInPath()
+        } catch {
+            return nil
+        }
+    }
+
+    private static func zipDirectoryForAttachment(_ directoryURL: URL) -> URL? {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("OlazAttachments", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let baseName = directoryURL.lastPathComponent.isEmpty ? "Folder" : directoryURL.lastPathComponent
+        let zipURL = dir.appendingPathComponent("\(baseName).zip")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", directoryURL.path, zipURL.path]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0, fm.fileExists(atPath: zipURL.path) else { return nil }
+            return zipURL.resolvingSymlinksInPath()
+        } catch {
+            return nil
+        }
+    }
+
+    /// Resolves `[NSItemProvider]` from a SwiftUI `.onDrop` modifier into local file URLs (or temporary PNG files for dropped images)
+    /// and sends them to `conversationId`.
+    @discardableResult
+    func handleDroppedProviders(_ providers: [NSItemProvider], in conversationId: String) -> Bool {
+        guard !conversationId.isEmpty, !providers.isEmpty else { return false }
+        let usable = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+                || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
+        }
+        guard !usable.isEmpty else { return false }
+        Task { @MainActor in
+            var resolvedURLs: [URL] = []
+            for provider in usable {
+                if let url = await Self.extractDroppedURL(from: provider) {
+                    resolvedURLs.append(url)
+                }
+            }
+            guard !resolvedURLs.isEmpty else { return }
+            let outcome = await self.sendMedia(resolvedURLs, to: conversationId)
+            self.report(outcome, in: conversationId)
+        }
+        return true
+    }
+
+    private static func extractDroppedURL(from provider: NSItemProvider) async -> URL? {
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            let fileURL: URL? = await withCheckedContinuation { continuation in
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { coding, _ in
+                    if let url = coding as? URL, url.isFileURL {
+                        continuation.resume(returning: url)
+                    } else if let data = coding as? Data,
+                              let url = URL(dataRepresentation: data, relativeTo: nil), url.isFileURL {
+                        continuation.resume(returning: url)
+                    } else if let str = coding as? String,
+                              let url = URL(string: str), url.isFileURL {
+                        continuation.resume(returning: url)
+                    } else {
+                        continuation.resume(returning: nil)
+                    }
+                }
+            }
+            if let fileURL { return fileURL }
+        }
+        for ut in [UTType.png, UTType.tiff, UTType.image, UTType.pdf] where provider.hasItemConformingToTypeIdentifier(ut.identifier) {
+            let rawData: Data? = await withCheckedContinuation { continuation in
+                provider.loadDataRepresentation(forTypeIdentifier: ut.identifier) { data, _ in
+                    continuation.resume(returning: data)
+                }
+            }
+            if let rawData, let img = NSImage(data: rawData),
+               let png = ClipboardPasteContent.renderImageToPNG(img, opaqueWhiteBackground: ut == .pdf)?.data,
+               let tempURL = writeTemporaryPasteImage(png, prefix: "dropped") {
+                return tempURL
+            }
+        }
+        return nil
     }
 
     // MARK: Screenshot
@@ -254,6 +466,7 @@ extension ZaloEngine {
         dropComposerConfirms()
         screenshotShare = nil
         screenCaptureNeedsPermission = false
+        stagedImages = [:]
     }
 
     /// Shows a failure or pending text for a composer action as the conversation's toast.
@@ -280,9 +493,12 @@ extension ZaloEngine {
 
     private func composeWithFiles(_ method: String, _ args: [Any], files: [URL]) async -> ComposerOutcome {
         guard !files.isEmpty else { return .cancelled }
-        // Photos are processed (resized, JXL) before the call returns; the uploads themselves continue in the page.
-        let answer = await raceTimeout(180) { [self] in JSBox(value: await callCompose(method, args, files: files)) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
+        // Photos are processed (resized) before the call returns; the uploads themselves continue in the page.
+        let answer = await raceTimeout(45) { [self] in JSBox(value: await callCompose(method, args, files: files)) }
+        guard let answer else {
+            EngineLog.shared.write("compose \(method) files=\(files.count) → timeout")
+            return .pending(CardActionOutcome.noAnswerText)
+        }
         var outcome = ComposerOutcome(json: answer.value)
         // Files were picked but the page's file input received none: say so instead of nothing.
         if outcome == .cancelled, (answer.value as? [String: Any])?["status"] as? String == "cancelled" {
