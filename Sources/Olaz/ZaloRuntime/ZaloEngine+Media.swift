@@ -197,7 +197,7 @@ enum VideoPoster {
         let poster = video.appendingPathExtension("poster.jpg")
         let fm = FileManager.default
         func modified(_ url: URL) -> Date? { (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date }
-        if let made = modified(poster), let source = modified(video), made >= source { return poster }
+        if let made = modified(poster), let source = modified(video), made.timeIntervalSince(source) >= 0 { return poster }
 
         guard let mime = mimeType(of: video) else { return nil }
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: video, options: [AVURLAssetOverrideMIMETypeKey: mime]))

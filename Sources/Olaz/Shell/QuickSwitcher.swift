@@ -198,7 +198,7 @@ private struct QuickSwitcherPanel: View {
                                 QuickRowView(row: row, isHighlighted: row.id == current?.id) {
                                     perform(row)
                                 } onHover: {
-                                    if Date.now >= ignoreHoverUntil { highlighted = row.id }
+                                    if Date.now.timeIntervalSince(ignoreHoverUntil) >= 0 { highlighted = row.id }
                                 }
                                 .id(row.id)
                             }

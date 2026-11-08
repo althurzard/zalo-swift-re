@@ -274,7 +274,7 @@ struct PollCreateDraft: Equatable {
         let filled = filledOptions
         if Set(filled).count != filled.count { return .duplicate }
         if filled.count < config.minOptions { return .tooFewOptions(config.minOptions) }
-        if hasDeadline && deadline <= now { return .pastDeadline }
+        if hasDeadline && deadline.timeIntervalSince(now) <= 0 { return .pastDeadline }
         return nil
     }
 
