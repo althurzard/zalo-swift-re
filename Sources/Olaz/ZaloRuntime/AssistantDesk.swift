@@ -149,7 +149,7 @@ final class AssistantDesk {
                 .filter { query.isEmpty || $0.displayName.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).contains(query) }
                 .prefix(limit)
             return rows.map { c -> [String: Any] in
-                var row: [String: Any] = ["id": c.id, "name": c.displayName, "isGroup": c.isGroup, "unread": c.unread, "pinned": c.pinned]
+                var row: [String: Any] = ["id": c.id, "name": c.id == engine.selfConversationId ? "My Cloud (chính bạn)" : c.displayName, "isSelf": c.id == engine.selfConversationId, "isGroup": c.isGroup, "unread": c.unread, "pinned": c.pinned]
                 if let preview = c.preview {
                     row["lastMessage"] = ["text": preview.text, "fromMe": preview.fromMe, "date": preview.date.map(Self.iso) ?? NSNull()]
                 }
@@ -206,7 +206,9 @@ final class AssistantDesk {
         // Reply only: no cold outreach to people who have not written recently.
         let incoming = (engine.messages[convId] ?? []).last { !$0.isMine }
         let lastIncomingDate = incoming?.date ?? ((conv.preview?.fromMe == false) ? conv.preview?.date : nil)
-        guard let lastIncomingDate, lastIncomingDate > Date().addingTimeInterval(-SendGuard.replyWindow) else {
+        // My Cloud (the account's own chat) is exempt: it is how the user tests the assistant safely.
+        let isSelf = convId == engine.selfConversationId
+        guard isSelf || (lastIncomingDate.map { $0 > Date().addingTimeInterval(-SendGuard.replyWindow) } ?? false) else {
             throw AssistantError("Chỉ được trả lời khách đã nhắn trong 7 ngày gần đây (chống spam). Hãy gọi read_messages trước nếu khách vừa nhắn.")
         }
         var warnings = guardrail.warnings(for: text, isGroup: conv.isGroup)
