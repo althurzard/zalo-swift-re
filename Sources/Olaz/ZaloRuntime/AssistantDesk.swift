@@ -20,6 +20,8 @@ final class AssistantDesk {
             .appendingPathComponent("Olaz", isDirectory: true).appendingPathComponent("assistant.sock").path
     }
 
+    struct MentionRef: Equatable, Sendable { var uid: String; var name: String }
+
     struct Draft: Identifiable, Equatable {
         enum State: Equatable {
             case pending
@@ -42,6 +44,8 @@ final class AssistantDesk {
         let created: Date
         var state: State = .pending
         var warnings: [String] = []
+        /// People tagged: "@name" must appear in `text`; offsets are computed at send time (the text may be edited).
+        var mentions: [MentionRef] = []
 
         var isOpen: Bool {
             switch state { case .pending, .queued, .sending: true; default: false }
@@ -171,14 +175,28 @@ final class AssistantDesk {
                 var row: [String: Any] = ["id": m.id, "from": m.isMine ? "me" : m.senderName, "isMine": m.isMine,
                                           "text": m.text, "date": Self.iso(m.date)]
                 if let quote = m.quote { row["quoting"] = quote.text }
+                for (k, v) in Self.kindInfo(m.kind) { row[k] = v }
+                if !m.mentions.isEmpty { row["mentions"] = m.mentions.map(\.uid) }
                 return row
             }
         case "propose_reply":
-            let draft = try propose(engine, convId: try string(p, "conversationId"), text: try string(p, "text"),
-                                    quote: p["quoteMessageId"] as? String, note: p["note"] as? String ?? "")
+            let refs = (p["mentions"] as? [[String: Any]] ?? []).compactMap { m -> MentionRef? in
+                guard let uid = m["uid"] as? String, let name = m["name"] as? String, !uid.isEmpty, !name.isEmpty else { return nil }
+                return MentionRef(uid: uid, name: name)
+            }
+            let draft = try await propose(engine, convId: try string(p, "conversationId"), text: try string(p, "text"),
+                                          quote: p["quoteMessageId"] as? String, note: p["note"] as? String ?? "", mentions: refs)
             return ["draftId": draft.id, "state": "pending",
                     "message": "Đã đưa vào hàng chờ duyệt. Người dùng phải bấm Gửi trong Olaz; không có gì được gửi tự động.",
                     "warnings": draft.warnings]
+        case "find_members":
+            let convId = try string(p, "conversationId")
+            guard engine.conversations.first(where: { $0.id == convId })?.isGroup == true else { throw AssistantError("Chỉ tag được trong nhóm") }
+            let found = await engine.mentionCandidates(in: convId, query: p["query"] as? String ?? "", excluding: [])
+            return found.prefix(20).map { ["uid": $0.isAll ? "-1" : $0.id, "name": $0.name, "isAll": $0.isAll] }
+        case "view_media":
+            return try await AssistantMedia.view(engine, conversationId: try string(p, "conversationId"), messageId: try string(p, "messageId"),
+                                                 frames: min(max(p["frames"] as? Int ?? 4, 1), 8))
         case "list_drafts":
             return drafts.suffix(50).map(Self.describe)
         case "get_draft":
@@ -218,7 +236,8 @@ final class AssistantDesk {
         }
     }
 
-    private func propose(_ engine: ZaloEngine, convId: String, text raw: String, quote: String?, note: String) throws -> Draft {
+    private func propose(_ engine: ZaloEngine, convId: String, text raw: String, quote: String?, note: String,
+                         mentions: [MentionRef]) async throws -> Draft {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw AssistantError("Nội dung trống") }
         guard text.count <= Self.maxTextLength else { throw AssistantError("Dài quá \(Self.maxTextLength) ký tự, hãy rút gọn") }
@@ -235,13 +254,28 @@ final class AssistantDesk {
         guard isSelf || (lastIncomingDate.map { $0 > Date().addingTimeInterval(-SendGuard.replyWindow) } ?? false) else {
             throw AssistantError("Chỉ được trả lời khách đã nhắn trong 7 ngày gần đây (chống spam). Hãy gọi read_messages trước nếu khách vừa nhắn.")
         }
+        if !mentions.isEmpty {
+            guard conv.isGroup else { throw AssistantError("Chỉ tag được trong nhóm") }
+            for ref in mentions {
+                guard text.contains("@" + ref.name) else { throw AssistantError("Nội dung phải có \"@\(ref.name)\" để tag người này") }
+                // The uid must be a member the official suggestion engine offers under that name.
+                let found = await engine.mentionCandidates(in: convId, query: ref.name, excluding: [])
+                guard found.contains(where: { ($0.isAll ? "-1" : $0.id) == ref.uid }) else {
+                    throw AssistantError("\(ref.name) (\(ref.uid)) không phải thành viên nhóm — dùng find_members")
+                }
+            }
+        }
+        if let quote, !(engine.messages[convId] ?? []).contains(where: { $0.id == quote }) {
+            throw AssistantError("Không thấy tin \(quote) để trích dẫn — gọi read_messages trước")
+        }
         var warnings = guardrail.warnings(for: text, isGroup: conv.isGroup)
+        if mentions.contains(where: { $0.uid == "-1" }) { warnings.append("Tag @All: cả nhóm nhận thông báo") }
         if let duplicate = guardrail.duplicateCount(text), duplicate > 0 {
             warnings.append("Nội dung giống hệt đã gửi cho \(duplicate) hội thoại trong 1 giờ qua")
         }
         let draft = Draft(id: UUID().uuidString.prefix(8).lowercased(), conversationId: convId, conversationName: conv.displayName,
                           text: text, quoteMessageId: quote, note: note,
-                          replyingTo: incoming?.text ?? conv.preview?.text ?? "", created: Date(), warnings: warnings)
+                          replyingTo: incoming?.text ?? conv.preview?.text ?? "", created: Date(), warnings: warnings, mentions: mentions)
         drafts.append(draft)
         if drafts.count > 300 { drafts.removeFirst(drafts.count - 300) }
         Self.notify(draft)
@@ -294,13 +328,13 @@ final class AssistantDesk {
                     self.update(draft.id, .failed(block)); continue
                 }
                 self.update(draft.id, .sending)
-                var ok = await self.engine?.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId) ?? false
+                var ok = await self.engine?.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId, mentions: Self.wireMentions(draft)) ?? false
                 // A conversation the official client has not loaded yet ('not-open'): open it on screen, then retry once.
                 if !ok, let engine = self.engine, engine.openConversationId != draft.conversationId {
                     engine.navigationRequest = draft.conversationId
                     for _ in 0..<40 where engine.openConversationId != draft.conversationId { try? await Task.sleep(for: .milliseconds(250)) }
                     try? await Task.sleep(for: .seconds(1.5))
-                    ok = await engine.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId)
+                    ok = await engine.sendText(draft.text, to: draft.conversationId, quoting: draft.quoteMessageId, mentions: Self.wireMentions(draft))
                 }
                 if ok {
                     self.guardrail.record(text: draft.text, conversationId: draft.conversationId)
@@ -336,6 +370,43 @@ final class AssistantDesk {
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "olaz.assistant.\(draft.id)", content: content, trigger: nil))
     }
 
+    /// UTF-16 offsets of each "@name" in the (possibly edited) text; a name no longer in the text is not tagged.
+    static func wireMentions(_ d: Draft) -> [Mention] {
+        let ns = d.text as NSString
+        var used: [NSRange] = []
+        return d.mentions.compactMap { ref in
+            var search = NSRange(location: 0, length: ns.length)
+            while true {
+                let r = ns.range(of: "@" + ref.name, options: [], range: search)
+                guard r.location != NSNotFound else { return nil }
+                if !used.contains(where: { NSIntersectionRange($0, r).length > 0 }) {
+                    used.append(r)
+                    return Mention(uid: ref.uid, pos: r.location, len: r.length, isAll: ref.uid == "-1")
+                }
+                search = NSRange(location: r.location + r.length, length: ns.length - r.location - r.length)
+            }
+        }
+    }
+
+    static func kindInfo(_ kind: ChatMessage.Kind) -> [String: Any] {
+        switch kind {
+        case .text: return ["kind": "text"]
+        case .photo(_, let w, let h): return ["kind": "photo", "media": ["width": w, "height": h, "viewable": true]]
+        case .sticker: return ["kind": "sticker", "media": ["viewable": true]]
+        case .gif: return ["kind": "gif", "media": ["viewable": true]]
+        case .video(_, let duration, _): return ["kind": "video", "media": ["durationSeconds": duration, "viewable": true]]
+        case .voice(_, let duration): return ["kind": "voice", "media": ["durationSeconds": duration, "viewable": false]]
+        case .file(let name, let size, _): return ["kind": "file", "media": ["name": name, "bytes": size, "viewable": true]]
+        case .link(let title, let url, _, let desc, let source):
+            return ["kind": "link", "link": ["title": title, "url": url?.absoluteString ?? "", "description": desc, "source": source]]
+        case .contactCard(let c): return ["kind": "contactCard", "contact": ["name": c.name, "phone": c.phone]]
+        case .location(let l): return ["kind": "location", "location": ["title": l.title, "address": l.address]]
+        case .call: return ["kind": "call"]
+        case .recalled: return ["kind": "recalled"]
+        default: return ["kind": "other"]
+        }
+    }
+
     private static func iso(_ date: Date) -> String { ISO8601DateFormatter().string(from: date) }
 
     private static func describe(_ d: Draft) -> [String: Any] {
@@ -350,7 +421,8 @@ final class AssistantDesk {
         case .failed(let why): state = "failed"; detail = why
         }
         return ["draftId": d.id, "conversationId": d.conversationId, "conversation": d.conversationName, "text": d.text,
-                "state": state, "detail": detail, "created": iso(d.created)]
+                "state": state, "detail": detail, "created": iso(d.created),
+                "quoteMessageId": d.quoteMessageId ?? NSNull(), "mentions": d.mentions.map { ["uid": $0.uid, "name": $0.name] }]
     }
 }
 

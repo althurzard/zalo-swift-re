@@ -74,6 +74,10 @@ private struct DraftCard: View {
             } else {
                 Text(draft.text).textSelection(.enabled)
             }
+            if draft.quoteMessageId != nil { Label("Trả lời trích dẫn tin của khách", systemImage: "arrowshape.turn.up.left").font(.caption).foregroundStyle(.secondary) }
+            if !draft.mentions.isEmpty {
+                Label("Tag: " + draft.mentions.map { "@" + $0.name }.joined(separator: ", "), systemImage: "at").font(.caption).foregroundStyle(.secondary)
+            }
             if !draft.note.isEmpty { Text("AI: \(draft.note)").font(.caption).foregroundStyle(.secondary) }
             ForEach(draft.warnings, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
             HStack {
