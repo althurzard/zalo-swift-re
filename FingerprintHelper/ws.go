@@ -49,13 +49,21 @@ func dialTLSChrome(ctx context.Context, network, addr string) (net.Conn, error) 
 	if err != nil {
 		return nil, err
 	}
-	spec, err := profiles.Chrome_108.GetClientHelloSpec()
-	if err != nil {
+	// Chrome_108 has no ClientHelloSpec factory in this utls build (ToSpec → "please implement this method"),
+	// so dial with the predefined ClientHelloID itself. Chrome offers only http/1.1 in ALPN on a WebSocket's
+	// connection (the upgrade is HTTP/1.1); do the same, or the server may pick h2 and refuse the upgrade.
+	uconn := utls.UClient(raw, &utls.Config{ServerName: host, NextProtos: []string{"http/1.1"}},
+		profiles.Chrome_108.GetClientHelloId(), false, false, true)
+	if err := uconn.BuildHandshakeState(); err != nil {
 		raw.Close()
 		return nil, err
 	}
-	uconn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom, false, false, true)
-	if err := uconn.ApplyPreset(&spec); err != nil {
+	for _, ext := range uconn.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	if err := uconn.MarshalClientHello(); err != nil {
 		raw.Close()
 		return nil, err
 	}
