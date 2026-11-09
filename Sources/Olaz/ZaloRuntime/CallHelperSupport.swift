@@ -29,7 +29,7 @@ enum CallHelperSignature {
         }
         let status = SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), parsed)
         guard status == errSecSuccess else {
-            throw Failure(message: "Trình gọi của Zalo không có chữ ký hợp lệ của VNG nên Olaz không chạy nó (mã \(status)).")
+            throw Failure(message: "Trình gọi của Zalo không có chữ ký hợp lệ của VNG nên ứng dụng không chạy nó (mã \(status)).")
         }
     }
 }

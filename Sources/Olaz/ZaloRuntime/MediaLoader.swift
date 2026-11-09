@@ -111,14 +111,16 @@ actor MediaLoader {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = Self.fileDeadline
-        config.httpAdditionalHeaders = ["User-Agent": PinnedHTTPSClient.userAgent]
+        // Fallback only: every request also sets the headers itself in `applyClientHeaders`,
+        // which follows a runtime upgrade without recreating the sessions.
+        config.httpAdditionalHeaders = ["User-Agent": ClientFingerprint.userAgent]
         session = URLSession(configuration: config)
         let fileConfig = URLSessionConfiguration.default
         fileConfig.urlCache = nil
         fileConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
         fileConfig.timeoutIntervalForRequest = Self.fileIdleTimeout     // idle timeout between received bytes
         fileConfig.timeoutIntervalForResource = 7 * 24 * 3600           // effectively no total deadline
-        fileConfig.httpAdditionalHeaders = ["User-Agent": PinnedHTTPSClient.userAgent]
+        fileConfig.httpAdditionalHeaders = ["User-Agent": ClientFingerprint.userAgent]
         fileSession = URLSession(configuration: fileConfig)
         self.resolver = resolver
         self.maxConcurrentDownloads = maxConcurrentDownloads
@@ -418,6 +420,63 @@ actor MediaLoader {
         "host", "content-length", "expect", "accept-encoding",
     ]
 
+    /// The flavour of a media request: which Chromium load it corresponds to.
+    enum RequestFlavour {
+        /// An `<img>` load: no-cors, image Accept.
+        case image
+        /// A `fetch()`/XHR by the renderer: cors mode.
+        case cors
+    }
+
+    /// Headers Chromium 108 sends with the equivalent load (captured from the official client —
+    /// `ClientFingerprint`, `reanalysis/wire-fingerprint.md`). Only names the caller did not set
+    /// are filled in. URLSession decodes gzip and brotli even when Accept-Encoding is set by us.
+    nonisolated static func applyClientHeaders(to request: inout URLRequest, flavour: RequestFlavour) {
+        func setDefault(_ name: String, _ value: String) {
+            if request.value(forHTTPHeaderField: name) == nil { request.setValue(value, forHTTPHeaderField: name) }
+        }
+        setDefault("User-Agent", ClientFingerprint.userAgent)
+        setDefault("sec-ch-ua", ClientFingerprint.secCHUA)
+        setDefault("sec-ch-ua-mobile", ClientFingerprint.secCHUAMobile)
+        setDefault("sec-ch-ua-platform", ClientFingerprint.secCHUAPlatform)
+        setDefault("accept-language", ClientFingerprint.acceptLanguage())
+        setDefault("accept-encoding", ClientFingerprint.acceptEncoding)
+        switch flavour {
+        case .image:
+            setDefault("Accept", ClientFingerprint.imageAccept)
+            setDefault("sec-fetch-dest", "image")
+            setDefault("sec-fetch-mode", "no-cors")
+        case .cors:
+            setDefault("Accept", "*/*")
+            setDefault("sec-fetch-dest", "empty")
+            setDefault("sec-fetch-mode", "cors")
+        }
+        setDefault("sec-fetch-site", "cross-site")
+    }
+
+    /// The same header set as a dict, for `PinnedHTTPSClient` — which builds its own HTTP/1.1
+    /// requests and cannot accept compressed responses (no Accept-Encoding passed).
+    nonisolated static func clientHeaders(_ flavour: RequestFlavour) -> [String: String] {
+        var headers: [String: String] = [
+            "sec-ch-ua": ClientFingerprint.secCHUA,
+            "sec-ch-ua-mobile": ClientFingerprint.secCHUAMobile,
+            "sec-ch-ua-platform": ClientFingerprint.secCHUAPlatform,
+            "accept-language": ClientFingerprint.acceptLanguage(),
+            "sec-fetch-site": "cross-site",
+        ]
+        switch flavour {
+        case .image:
+            headers["Accept"] = ClientFingerprint.imageAccept
+            headers["sec-fetch-dest"] = "image"
+            headers["sec-fetch-mode"] = "no-cors"
+        case .cors:
+            headers["Accept"] = "*/*"
+            headers["sec-fetch-dest"] = "empty"
+            headers["sec-fetch-mode"] = "cors"
+        }
+        return headers
+    }
+
     /// Headers safe to send to `url`: names are RFC 7230 tokens, values hold no CR/LF/control characters,
     /// hop-by-hop names are dropped, and sensitive ones only go to https Zalo hosts.
     nonisolated static func sanitizedHeaders(_ headers: [String: String], for url: URL) -> [String: String] {
@@ -456,8 +515,13 @@ actor MediaLoader {
                              ttfb: TimeInterval? = nil, progress: (@Sendable (Double) -> Void)? = nil) async throws -> URL {
         guard let url = Self.normalized(url) else { throw LoadError.badURL }
         try failIfDead(url.host?.lowercased() ?? "")
+        if let file = try await downloadWithHeadersViaHelper(url, headers: headers, maxBytes: maxBytes, ttfb: ttfb,
+                                                             progress: progress, redirectsLeft: 5) {
+            return file
+        }
         var request = URLRequest(url: url)
         for (name, value) in Self.sanitizedHeaders(headers, for: url) { request.setValue(value, forHTTPHeaderField: name) }
+        Self.applyClientHeaders(to: &request, flavour: .cors)
         let hub = FileProgress()
         let observer = progress.map { hub.add($0) }
         defer { if let observer { hub.remove(observer) } }
@@ -489,6 +553,171 @@ actor MediaLoader {
             throw LoadError.tooLarge
         }
         return downloaded
+    }
+
+    // MARK: Fingerprint-helper paths (Chromium 108's TLS/HTTP2; URLSession/DoH are the fallback)
+
+    /// nil = helper unavailable, caller falls back. A helper *upstream* failure is thrown
+    /// (a retry on the other stack would change the fingerprint), except name-resolution
+    /// failures, which the DoH machinery may still recover.
+    private func helperOrFallback(_ error: Error) -> Error? {
+        guard let failure = error as? FingerprintProxy.Error else { return error }
+        switch failure {
+        case .unavailable, .connectionLost:
+            return nil
+        case .tooLarge:
+            return LoadError.tooLarge
+        case .requestFailed(let message, _):
+            if message.lowercased().contains("timeout") || message.lowercased().contains("canceled") {
+                return LoadError.timedOut
+            }
+            let dnsish = ["no such host", "lookup", "dns", "connection refused", "connection reset"]
+            if dnsish.contains(where: { message.lowercased().contains($0) }) { return nil }
+            return failure
+        }
+    }
+
+    private func helperHeaders(base: [String: String], url: URL, flavour: RequestFlavour) -> [(String, String)] {
+        var ordered: [(String, String)] = Self.sanitizedHeaders(base, for: url).map { ($0.key, $0.value) }
+        let defaults = Self.clientHeaders(flavour)
+        let present = Set(ordered.map { $0.0.lowercased() })
+        ordered.append(contentsOf: defaults.filter { !present.contains($0.0.lowercased()) }.map { ($0.key, $0.value) })
+        return ordered
+    }
+
+    private func fetchImageViaHelper(_ url: URL) async throws -> Fetched? {
+        guard await FingerprintProxy.shared.ready(seconds: 2) else { return nil }
+        var request = FingerprintProxy.Request(url: url)
+        request.headers = helperHeaders(base: [:], url: url, flavour: .image)
+        request.timeoutMs = 20_000
+        request.maxBytes = 96 << 20
+        do {
+            let response = try await FingerprintProxy.shared.perform(request)
+            guard (200..<300).contains(response.head.status) else { throw LoadError.http(response.head.status) }
+            let contentType = response.head.headers.first { $0.0.lowercased() == "content-type" }?.1
+            store(response.body, for: url, contentType: contentType)
+            return Fetched(data: response.body, framed: true, finalURL: URL(string: response.head.url) ?? url)
+        } catch {
+            if let fallback = helperOrFallback(error) { throw fallback }
+            return nil
+        }
+    }
+
+    private func fetchFileViaHelper(_ url: URL, directory: URL, progress: FileProgress) async throws -> URL? {
+        guard await FingerprintProxy.shared.ready(seconds: 2) else { return nil }
+        var request = FingerprintProxy.Request(url: url)
+        request.headers = helperHeaders(base: [:], url: url, flavour: .cors)
+        request.maxBytes = Int64(Self.maxFileBytes)
+        request.idleMs = Int(Self.fileIdleTimeout * 1000)
+        do {
+            let start = try await FingerprintProxy.shared.stream(request)
+            let head: FingerprintProxy.ResponseHead
+            let events: AsyncThrowingStream<FingerprintProxy.StreamEvent, Swift.Error>
+            switch start {
+            case .head(let responseHead, let body):
+                head = responseHead
+                events = body
+            case .complete(let response):
+                head = response.head
+                guard (200..<300).contains(head.status) else { throw LoadError.http(head.status) }
+                let temp = Self.partFile(in: directory)
+                try response.body.write(to: temp)
+                return temp
+            }
+            guard (200..<300).contains(head.status) else { throw LoadError.http(head.status) }
+            progress.reset()
+            return try await streamToPartFile(events, directory: directory, progress: progress, head: head)
+        } catch {
+            if let fallback = helperOrFallback(error) { throw fallback }
+            return nil
+        }
+    }
+
+    private func downloadWithHeadersViaHelper(_ url: URL, headers: [String: String], maxBytes: Int,
+                                              ttfb: TimeInterval?, progress: (@Sendable (Double) -> Void)?,
+                                              redirectsLeft: Int) async throws -> URL? {
+        guard await FingerprintProxy.shared.ready(seconds: 2) else { return nil }
+        var request = FingerprintProxy.Request(url: url)
+        request.follow = false // redirects are re-issued here, so per-hop headers stay under our control
+        request.headers = helperHeaders(base: headers, url: url, flavour: .cors)
+        request.maxBytes = Int64(maxBytes)
+        request.idleMs = 30_000
+        if let ttfb { request.firstByteMs = Int(ttfb * 1000) }
+        let hub = FileProgress()
+        let observer = progress.map { hub.add($0) }
+        defer { if let observer { hub.remove(observer) } }
+        do {
+            let start = try await FingerprintProxy.shared.stream(request)
+            switch start {
+            case .complete(let response):
+                // The helper's no-redirect answer: a 3xx to follow (sensitive headers do not
+                // leave the host they were meant for, like the URLSession path), a 2xx with its
+                // whole body, or an error status.
+                if (300..<400).contains(response.head.status), redirectsLeft > 0,
+                   let location = response.head.headers.first(where: { $0.0.lowercased() == "location" })?.1,
+                   let next = URL(string: location, relativeTo: url)?.absoluteURL,
+                   let normalized = Self.normalized(next) {
+                    var nextHeaders = headers
+                    if url.host?.lowercased() != normalized.host?.lowercased() {
+                        for name in Self.sensitiveHeaderNames { nextHeaders.removeValue(forKey: name) }
+                    }
+                    return try await downloadWithHeadersViaHelper(normalized, headers: nextHeaders, maxBytes: maxBytes,
+                                                                  ttfb: ttfb, progress: progress, redirectsLeft: redirectsLeft - 1)
+                }
+                guard (200..<300).contains(response.head.status) else { throw LoadError.http(response.head.status) }
+                let temp = Self.partFile(in: Self.partsDirectory())
+                try response.body.write(to: temp)
+                return temp
+            case .head(let head, let events):
+                guard (200..<300).contains(head.status) else { throw LoadError.http(head.status) }
+                hub.reset()
+                return try await streamToPartFile(events, directory: Self.partsDirectory(), progress: hub, head: head)
+            }
+        } catch {
+            if let fallback = helperOrFallback(error) { throw fallback }
+            return nil
+        }
+    }
+
+    /// Where `.part` files of helper downloads live until the caller moves them into place.
+    private nonisolated static func partsDirectory() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("Olaz-parts", isDirectory: true)
+    }
+
+    private func expectedBytes(_ head: FingerprintProxy.ResponseHead) -> Int? {
+        head.headers.first { $0.0.lowercased() == "content-length" }.flatMap { Int($0.1) }
+    }
+
+    /// Streams a body into a fresh `.part` file; progress and cancellation are honoured.
+    private func streamToPartFile(_ events: AsyncThrowingStream<FingerprintProxy.StreamEvent, Swift.Error>,
+                                  directory: URL, progress: FileProgress?,
+                                  head: FingerprintProxy.ResponseHead) async throws -> URL {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temp = Self.partFile(in: directory)
+        guard FileManager.default.createFile(atPath: temp.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let handle = try FileHandle(forWritingTo: temp)
+        let expected = expectedBytes(head)
+        do {
+            var received = 0
+            for try await event in events {
+                switch event {
+                case .chunk(let data):
+                    try handle.write(contentsOf: data)
+                    received += data.count
+                    progress?.report(received: received, total: expected)
+                case .end:
+                    break
+                }
+            }
+            try handle.close()
+            return temp
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: temp)
+            throw error
+        }
     }
 
     // MARK: Local files
@@ -559,10 +788,13 @@ actor MediaLoader {
     private func download(_ url: URL, redirectsLeft: Int) async throws -> Fetched {
         guard let host = url.host?.lowercased() else { throw LoadError.badURL }
         try failIfDead(host)
+        if let fetched = try await fetchImageViaHelper(url) { return fetched }
         return try await withDNSFallback(host: host, doh: {
             try await self.fetchViaDoHFetched(url, redirectsLeft: redirectsLeft)
         }, system: {
-            let (data, response) = try await self.session.data(for: URLRequest(url: url))
+            var request = URLRequest(url: url)
+            Self.applyClientHeaders(to: &request, flavour: .image)
+            let (data, response) = try await self.session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(status) else { throw LoadError.http(status) }
             self.store(data, for: url, contentType: response.mimeType)
@@ -697,7 +929,7 @@ actor MediaLoader {
         let addresses = try await resolver.resolve(host)
         let response: PinnedHTTPSClient.Response
         do {
-            response = try await PinnedHTTPSClient.get(url, addresses: addresses)
+            response = try await PinnedHTTPSClient.get(url, addresses: addresses, clientHeaders: Self.clientHeaders(.image))
         } catch {
             await resolver.invalidate(host)
             throw error
@@ -875,6 +1107,7 @@ actor MediaLoader {
     private func fetchFileToTemp(_ url: URL, directory: URL, redirectsLeft: Int, progress: FileProgress) async throws -> URL {
         guard let host = url.host?.lowercased() else { throw LoadError.badURL }
         try failIfDead(host)
+        if let file = try await fetchFileViaHelper(url, directory: directory, progress: progress) { return file }
         return try await withDNSFallback(host: host, confirmTimeouts: true, doh: {
             try await self.fetchFileViaDoH(url, directory: directory, redirectsLeft: redirectsLeft, progress: progress)
         }, system: {
@@ -891,7 +1124,8 @@ actor MediaLoader {
         do {
             response = try await PinnedHTTPSClient.download(url, addresses: addresses, to: temp,
                                                             idleTimeout: Self.fileIdleTimeout,
-                                                            maxBody: Self.maxFileBytes) { received, total in
+                                                            maxBody: Self.maxFileBytes,
+                                                            clientHeaders: Self.clientHeaders(.cors)) { received, total in
                 progress.report(received: received, total: total)
             }
         } catch {
@@ -973,10 +1207,12 @@ actor MediaLoader {
     private func fetchFileViaSession(_ url: URL, directory: URL, progress: FileProgress) async throws -> URL {
         progress.reset()
         let delegate = FileDownloadDelegate(progress: progress)
+        var request = URLRequest(url: url)
+        Self.applyClientHeaders(to: &request, flavour: .cors)
         let downloaded: URL
         let response: URLResponse
         do {
-            (downloaded, response) = try await fileSession.download(for: URLRequest(url: url), delegate: delegate)
+            (downloaded, response) = try await fileSession.download(for: request, delegate: delegate)
         } catch {
             if delegate.exceeded { throw LoadError.tooLarge }
             throw error

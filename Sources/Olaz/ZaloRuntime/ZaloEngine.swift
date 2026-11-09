@@ -70,6 +70,8 @@ final class ZaloEngine {
 
     private(set) var phase: Phase = .starting
     private(set) var conversations: [ConversationSummary] = []
+    /// `conversations` by id: the adapter posts only the rows that changed (`reset` replaces everything).
+    @ObservationIgnored private var conversationIndex: [String: ConversationSummary] = [:]
     private(set) var profile: Profile?
     /// Why the session ended, shown on the login screen (e.g. kicked by another PC login).
     private(set) var signOutNotice: String?
@@ -223,9 +225,14 @@ final class ZaloEngine {
     }
 
     private func boot(_ install: OfficialZaloInstall.Info) {
+        // Chromium-fingerprint network stack: ready before the renderer's first requests.
+        FingerprintProxy.shared.warmUp()
         clientVersion = install.version
+        // Everything that talks to Zalo (User-Agent, page query, media fetches) reports the
+        // runtime's own API version, exactly as the official main process of that build would.
+        ClientFingerprint.clientVersion = install.clientVersion
 
-        let platform = ZaloPlatform(appVersion: install.version)
+        let platform = ZaloPlatform(appVersion: install.version, clientVersion: install.clientVersion)
         let mainProcess = ZaloMainProcess(platform: platform)
         let ua = OfficialClientHost.userAgent(clientType: platform.identity.clientType,
                                               clientVersion: platform.identity.clientVersion)
@@ -250,7 +257,7 @@ final class ZaloEngine {
             }
         }
         host.bridge.trace = { key, args in
-            guard !key.contains("ZLog"), !key.hasPrefix("$zelectron.store") else { return }
+            guard !key.contains("ZLog"), !key.hasPrefix("$zelectron.store"), !key.hasPrefix("$znode.sqliteHost") else { return }
             log.write("bridge \(key)\(EngineLog.shape(args))")
         }
         host.bridge.onHandlerError = { key, error in log.write("bridge-error \(key): \(error.localizedDescription)") }
@@ -277,11 +284,23 @@ final class ZaloEngine {
         host.load(.login, query: mainProcess.pageQuery())
     }
 
+    /// Where the official client keeps its databases (Settings ▸ Engine).
+    var storageBackend: ZaloMainProcess.StorageBackend? { mainProcess?.storage }
+
+    /// Moves this install to the native SQLite backend: the account is logged out and starts over on SQLite at the
+    /// next login (history comes back with the phone → PC sync).
+    func switchToSQLite() {
+        mainProcess?.switchStorage(.sqlite)
+        logOut()
+    }
+
     /// Clears the session cookies and local client data, then shows a fresh QR.
     func logOut() {
         ZaloMainProcess.clearCookies()
         mainProcess?.resetAccountState()
         profile = nil
+        conversations = []
+        conversationIndex = [:]
         resetConversationActions()
         resetCloud()
         resetPolls()
@@ -392,8 +411,7 @@ final class ZaloEngine {
         case "main" where state["chat"] != nil || state["typing"] != nil:
             handleChat(state: state)
         case "main" where state["conversations"] != nil:
-            let rows = state["conversations"] as? [[String: Any]] ?? []
-            conversations = rows.compactMap(Self.conversation).sorted(by: Self.listOrder)
+            mergeConversations(state)
         case "main":
             if let user = state["user"] as? [String: Any], let id = user["userId"] as? String, !id.isEmpty {
                 profile = Profile(
@@ -497,6 +515,23 @@ final class ZaloEngine {
     private func log(_ line: String) {
         recentLog.append(line)
         if recentLog.count > 200 { recentLog.removeFirst(recentLog.count - 200) }
+    }
+
+    /// The conversation list arrives as deltas (state-adapter.js): `conversations` holds the rows that changed since the
+    /// last post, `removed` the ids that left the official index, `reset` (or the legacy full-list shape without it) replaces
+    /// the whole list. A large account has thousands of rows and some preview changes every tick: merging by id keeps the
+    /// bridge payload and the SwiftUI invalidation proportional to what changed.
+    private func mergeConversations(_ state: [String: Any]) {
+        let rows = (state["conversations"] as? [[String: Any]] ?? []).compactMap(Self.conversation)
+        let reset = state["reset"] as? Bool ?? (state["removed"] == nil)
+        let removed = state["removed"] as? [String] ?? []
+        var index = reset ? [:] : conversationIndex
+        for id in removed { index.removeValue(forKey: id) }
+        for row in rows { index[row.id] = row }
+        guard reset || index != conversationIndex else { return }
+        conversationIndex = index
+        let sorted = index.values.sorted(by: Self.listOrder)
+        if sorted != conversations { conversations = sorted }
     }
 
     private static func conversation(_ row: [String: Any]) -> ConversationSummary? {

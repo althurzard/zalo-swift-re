@@ -23,6 +23,12 @@ enum BridgeImplementation {
 
         mainProcess.install(on: bridge)
 
+        // Native SQLite behind the official DAL (sqlite-host.js); absent on the IndexedDB backend.
+        if let sqlite = mainProcess.sqlite {
+            sqlite.install(on: bridge)
+            bridge.value("$znode.sqliteHostEnabled", true)
+        }
+
         // electron-store backing for local-modules.js `getElectronStore`
         bridge.sync("$zelectron.storePath") { args in platform.storeURL(args.string(0) ?? "config").path }
         bridge.sync("$zelectron.storeRead") { args in platform.readStore(args.string(0) ?? "config") }
@@ -42,13 +48,16 @@ enum BridgeImplementation {
             "release": field(uts.release),
             "version": field(uts.version),
             "arch": field(uts.machine) == "x86_64" ? "x64" : "arm64",
-            "hostname": process.hostName,
+            // Node's os.hostname() is gethostname(); ProcessInfo.hostName lower-cases and can
+            // disagree — and Zalo sends the value (computer_name) to its servers.
+            "hostname": Self.hostname(),
             "homedir": NSHomeDirectory(),
             "tmpdir": NSTemporaryDirectory(),
             "totalmem": process.physicalMemory,
             "cpus": process.activeProcessorCount,
             "uptime": Int(process.systemUptime),
             "username": NSUserName(),
+            "networkInterfaces": Self.networkInterfacesJSON(),
         ] as [String: Any])
         bridge.value("$znode.fs.constants", ["F_OK": 0, "R_OK": 4, "W_OK": 2, "X_OK": 1])
         bridge.value("$znode.fs.constanst", ["F_OK": 0, "R_OK": 4, "W_OK": 2, "X_OK": 1])
@@ -76,6 +85,109 @@ enum BridgeImplementation {
         FileSystemBridge.install(on: bridge, platform: platform)
         CryptoBridge.install(on: bridge)
         FileManagerBridge.install(on: bridge, platform: platform)
+    }
+}
+
+/// Host facts Node's `os` module reports, produced the way Node produces them
+/// (gethostname / getifaddrs), because Zalo puts them on the wire
+/// (`computer_name`, the QoS record's local IP).
+extension BridgeImplementation {
+    /// Node's `os.hostname()` = `gethostname(3)`.
+    nonisolated static func hostname() -> String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        gethostname(&buffer, buffer.count)
+        let name = String(cString: buffer)
+        return name.isEmpty ? ProcessInfo.processInfo.hostName : name
+    }
+
+    /// Node's `os.networkInterfaces()` as a JSON array of `[name, [addresses…]]` pairs (an array,
+    /// not an object: the JSON round-trip through the bridge spec must keep getifaddrs order —
+    /// the official QoS code takes the *first* non-internal IPv4 as the local IP).
+    /// Address objects match Node's shape: address, netmask, family, mac, internal, cidr.
+    nonisolated static func networkInterfacesJSON() -> String {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return "[]" }
+        defer { freeifaddrs(ifaddr) }
+
+        // bytes in wire order → dotted / IPv6 text
+        func text(_ bytes: [UInt8]) -> String {
+            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            guard inet_ntop(bytes.count == 4 ? AF_INET : AF_INET6, bytes, &buffer, socklen_t(buffer.count)) != nil else { return "" }
+            return String(cString: buffer)
+        }
+        // contiguous netmask bits, or nil when the mask is not 1…10…0 (Node: cidr omitted)
+        func prefixLength(_ bytes: [UInt8]) -> Int? {
+            var bits = 0
+            var gapSeen = false
+            for byte in bytes {
+                let ones = byte.nonzeroBitCount
+                guard !gapSeen || ones == 0 else { return nil }      // ones after a gap: invalid mask
+                guard ones == 0 || byte == (0xFF << (8 - ones)) & 0xFF else { return nil }
+                if ones < 8 { gapSeen = true }
+                bits += ones
+            }
+            return bits
+        }
+
+        // MAC per interface, from the AF_LINK entries (one per interface).
+        var macs: [String: String] = [:]
+        var cursor: UnsafeMutablePointer<ifaddrs>? = ifaddr
+        while let current = cursor {
+            let interface = current.pointee
+            cursor = interface.ifa_next
+            guard let sockaddr = interface.ifa_addr, sockaddr.pointee.sa_family == UInt8(AF_LINK) else { continue }
+            let name = String(cString: interface.ifa_name)
+            let link = sockaddr.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { $0.pointee }
+            guard link.sdl_alen == 6 else { continue }
+            let bytes = withUnsafeBytes(of: link.sdl_data) { Array($0) }
+            let start = Int(link.sdl_nlen)
+            guard start + 6 <= bytes.count else { continue }
+            macs[name] = (start..<(start + 6)).map { String(format: "%02x", bytes[$0]) }.joined(separator: ":")
+        }
+
+        var order: [String] = []
+        var addresses: [String: [[String: Any]]] = [:]
+        cursor = ifaddr
+        while let current = cursor {
+            let interface = current.pointee
+            cursor = interface.ifa_next
+            let name = String(cString: interface.ifa_name)
+            guard let sockaddr = interface.ifa_addr else { continue }
+            let internalInterface = interface.ifa_flags & UInt32(IFF_LOOPBACK) != 0
+            var entry: [String: Any]
+            switch sockaddr.pointee.sa_family {
+            case UInt8(AF_INET):
+                let address = sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
+                    withUnsafeBytes(of: pointer.pointee.sin_addr) { text(Array($0)) }
+                }
+                let maskBytes = interface.ifa_netmask.map { mask in
+                    mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
+                        withUnsafeBytes(of: pointer.pointee.sin_addr) { Array($0) }
+                    }
+                } ?? []
+                entry = ["address": address, "netmask": text(maskBytes), "family": "IPv4",
+                         "mac": macs[name] ?? "", "internal": internalInterface]
+                if let prefix = prefixLength(maskBytes) { entry["cidr"] = "\(address)/\(prefix)" }
+            case UInt8(AF_INET6):
+                let sockaddr6 = sockaddr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+                var address = withUnsafeBytes(of: sockaddr6.sin6_addr) { text(Array($0)) }
+                // Node appends the scope for scoped addresses (fe80::…%en0).
+                if sockaddr6.sin6_scope_id != 0 { address += "%\(name)" }
+                let maskBytes = interface.ifa_netmask.map { $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { withUnsafeBytes(of: $0.pointee.sin6_addr) { Array($0) } } } ?? []
+                entry = ["address": address, "netmask": text(maskBytes), "family": "IPv6",
+                         "mac": macs[name] ?? "", "internal": internalInterface]
+                if let prefix = prefixLength(maskBytes) { entry["cidr"] = "\(address)/\(prefix)" }
+            default:
+                continue
+            }
+            if addresses[name] == nil { order.append(name); addresses[name] = [] }
+            addresses[name]?.append(entry)
+        }
+
+        let pairs: [[Any]] = order.map { [$0, addresses[$0] ?? []] }
+        guard JSONSerialization.isValidJSONObject(pairs),
+              let data = try? JSONSerialization.data(withJSONObject: pairs) else { return "[]" }
+        return String(decoding: data, as: UTF8.self)
     }
 }
 

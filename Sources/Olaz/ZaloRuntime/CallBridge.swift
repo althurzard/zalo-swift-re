@@ -217,7 +217,7 @@ final class CallBridge {
             return
         }
         guard let executable, FileManager.default.isExecutableFile(atPath: executable.path) else {
-            fail("Không tìm thấy trình gọi của Zalo (ZaloHelper.app/Contents/MacOS/ZaloCall). Hãy mở lại Olaz để cài lại.")
+            fail("Không tìm thấy trình gọi của Zalo (ZaloHelper.app/Contents/MacOS/ZaloCall). Hãy mở lại ứng dụng để cài lại.")
             return
         }
         // A ZaloCall left behind by a crashed Olaz (its argv points into our dead socket directory).

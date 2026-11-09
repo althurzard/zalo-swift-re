@@ -192,7 +192,7 @@
     // Diagnostics forwarded by the DAL worker prelude (errors only, never record data).
     w.addEventListener('message', (e) => {
       const d = e.data;
-      if (d && typeof d === 'object' && typeof d.__olazLog === 'string') { e.stopImmediatePropagation(); hostLog('[worker:log] ' + name + ' ' + d.__olazLog); }
+      if (d && typeof d === 'object' && typeof d.__zhostLog === 'string') { e.stopImmediatePropagation(); hostLog('[worker:log] ' + name + ' ' + d.__zhostLog); }
     });
     w.addEventListener('error', (e) => hostLog('[worker:error] ' + name + ' ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || '')));
     w.addEventListener('messageerror', () => hostLog('[worker:messageerror] ' + name));

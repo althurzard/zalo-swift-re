@@ -19,12 +19,16 @@ enum PinnedHTTPSClient {
         }
     }
 
-    static let userAgent = "ZaloPC-darwin-23v694"
+    /// The client's User-Agent — follows the installed runtime's API version
+    /// (`ClientFingerprint.clientVersion`, set at boot).
+    static var userAgent: String { ClientFingerprint.userAgent }
 
     /// GET `url` by connecting to each address in turn until one yields a response.
-    /// `timeout` is per address attempt.
+    /// `timeout` is per address attempt. `clientHeaders` are sent in addition to the
+    /// Chromium defaults (media fetches pass the headers the official renderer would send).
     static func get(_ url: URL, addresses: [IPv4Address], timeout: TimeInterval = 10,
-                    maxBody: Int = HTTPResponseParser.defaultMaxBody) async throws -> Response {
+                    maxBody: Int = HTTPResponseParser.defaultMaxBody,
+                    clientHeaders: [String: String] = [:]) async throws -> Response {
         guard url.scheme == "https", let host = url.host, !host.isEmpty else { throw ClientError.badURL }
         let port = UInt16(url.port ?? 443)
         var lastError: Error = ClientError.badURL
@@ -32,7 +36,7 @@ enum PinnedHTTPSClient {
             try Task.checkCancellation()
             do {
                 return try await withThrowingTaskGroup(of: Response.self) { group in
-                    group.addTask { try await fetch(url, host: host, address: address, port: port, maxBody: maxBody) }
+                    group.addTask { try await fetch(url, host: host, address: address, port: port, maxBody: maxBody, clientHeaders: clientHeaders) }
                     group.addTask {
                         try await Task.sleep(for: .seconds(timeout))
                         throw ClientError.timedOut
@@ -61,6 +65,7 @@ enum PinnedHTTPSClient {
     static func download(_ url: URL, addresses: [IPv4Address], to file: URL,
                          idleTimeout: TimeInterval = 30,
                          maxBody: Int = HTTPResponseParser.defaultMaxBody,
+                         clientHeaders: [String: String] = [:],
                          progress: (@Sendable (Int, Int?) -> Void)? = nil) async throws -> Response {
         guard url.scheme == "https", let host = url.host, !host.isEmpty else { throw ClientError.badURL }
         let port = UInt16(url.port ?? 443)
@@ -74,7 +79,8 @@ enum PinnedHTTPSClient {
                     let handle = try FileHandle(forWritingTo: file)
                     defer { try? handle.close() }
                     return try await fetch(url, host: host, address: address, port: port, maxBody: maxBody,
-                                           sink: handle, idleTimeout: idleTimeout, received: received, progress: progress)
+                                           sink: handle, idleTimeout: idleTimeout, received: received, progress: progress,
+                                           clientHeaders: clientHeaders)
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -100,14 +106,15 @@ enum PinnedHTTPSClient {
     private static func fetch(_ url: URL, host: String, address: IPv4Address, port: UInt16,
                               maxBody: Int, sink: FileHandle? = nil, idleTimeout: TimeInterval? = nil,
                               received: Counter? = nil,
-                              progress: (@Sendable (Int, Int?) -> Void)? = nil) async throws -> Response {
+                              progress: (@Sendable (Int, Int?) -> Void)? = nil,
+                              clientHeaders: [String: String] = [:]) async throws -> Response {
         let connection = Connection(host: host, address: address, port: port)
         return try await withTaskCancellationHandler {
             defer { connection.cancel() }
             do {
                 connection.armWatchdog(idleTimeout)
                 try await connection.start()
-                try await connection.send(requestBytes(for: url, host: host))
+                try await connection.send(requestBytes(for: url, host: host, clientHeaders: clientHeaders))
                 var parser = HTTPResponseParser(maxBody: maxBody, sink: sink)
                 while true {
                     try Task.checkCancellation()
@@ -134,14 +141,17 @@ enum PinnedHTTPSClient {
         }
     }
 
-    private static func requestBytes(for url: URL, host: String) -> Data {
+    private static func requestBytes(for url: URL, host: String, clientHeaders: [String: String]) -> Data {
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         var target = components?.percentEncodedPath ?? "/"
         if target.isEmpty { target = "/" }
         if let query = components?.percentEncodedQuery { target += "?" + query }
         var hostHeader = host
         if let port = url.port, port != 443 { hostHeader += ":\(port)" }
-        let text = "GET \(target) HTTP/1.1\r\nHost: \(hostHeader)\r\nUser-Agent: \(userAgent)\r\n"
+        var headers = "User-Agent: \(userAgent)\r\n"
+        for (name, value) in clientHeaders { headers += "\(name): \(value)\r\n" }
+        // `identity`: this client parses the HTTP framing itself and cannot decode gzip/br.
+        let text = "GET \(target) HTTP/1.1\r\nHost: \(hostHeader)\r\n\(headers)"
             + "Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
         return Data(text.utf8)
     }

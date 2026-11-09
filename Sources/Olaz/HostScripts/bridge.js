@@ -82,6 +82,7 @@
   // The official preload maps {apiKey, type} entries to ipcRenderer calls
   // (module DmP7). Swift plays the main process (`ZaloBridge` channel handlers).
   const ipcListeners = new Map(); // channel -> Set(cb(event, ...args))
+  let nextV2Key = 0;
   const ipcHandlers = new Map();  // channel -> handler(event, ...args) (PROVIDE)
   const ipcEvent = () => ({ sender: null, ports: [], returnValue: undefined });
   const ipc = {
@@ -111,7 +112,9 @@
       case 'RAW_SEND': return (...a) => ipc.send(channel, a);
       case 'SUBSCRIBE': return (cb) => ipc.on(channel, cb);
       case 'SUBSCRIBE_ONCE': return (cb) => ipc.on(channel, cb, true);
-      case 'SUBSCRIBE_V2': return (cb) => ipc.on(channel, (event, ...a) => cb(0, event, ...a));
+      // The official preload hands V2 subscribers a key and posts the event's MessagePorts to the page under that key
+      // (`window.postMessage({zChannelId:'__Z_I2M__', apiKey, key}, 'file://', ports)`); `ipcEmitPorts` does both.
+      case 'SUBSCRIBE_V2': return (cb) => ipc.on(channel, (event, ...a) => cb(event.v2Key || 0, event, ...a));
       case 'UNSUBSCRIBE': return () => ipc.removeAll(channel);
       case 'PROVIDE': return (handler) => { ipcHandlers.set(channel, handler); post({ kind: 'provide', channel }); };
       case 'STOP_PROVIDE': return () => { ipcHandlers.delete(channel); };
@@ -190,6 +193,22 @@
       for (const cb of Array.from(set)) { try { cb(ipcEvent(), ...decoded); } catch (e) { setTimeout(() => { throw e; }); } }
       return set.size;
     },
+    // Main → renderer: webContents.postMessage(channel, message, ports) — a V2 subscription event carrying MessagePorts.
+    // `args` are plain JS values (no bridge encoding): the caller is a host script in the same page.
+    ipcEmitPorts(channel, args, ports) {
+      const set = ipcListeners.get(channel); if (!set) return 0;
+      const key = ++nextV2Key;
+      // The official `$zsub` wrapper (renderer) pairs the ports it receives in a window message with the event of the
+      // same key; it only accepts the message from this window and the Electron file:// origin.
+      const data = { zChannelId: '__Z_I2M__', apiKey: channel, key };
+      try { window.dispatchEvent(new MessageEvent('message', { data, origin: 'file://', source: window, ports: ports || [] })); }
+      catch (e) { log('[bridge] port message failed', String(e)); }
+      const event = Object.assign(ipcEvent(), { ports: ports || [], v2Key: key });
+      for (const cb of Array.from(set)) { try { cb(event, ...(args || [])); } catch (e) { setTimeout(() => { throw e; }); } }
+      return set.size;
+    },
+    // Whether the page listens on an IPC channel (host scripts emulating main-process pushes).
+    ipcHasListener(channel) { const set = ipcListeners.get(channel); return !!set && set.size > 0; },
     // Main → renderer request: webContents.invoke(channel, ...args) answered by a PROVIDE handler.
     async ipcInvokeRenderer(channel, args) {
       const handler = ipcHandlers.get(channel);

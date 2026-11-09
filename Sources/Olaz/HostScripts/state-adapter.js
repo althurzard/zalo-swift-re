@@ -137,7 +137,7 @@
         if (convTimer) return;
         const regs = () => diRegistrations(req);
         const pick = (pred) => { for (const r of regs()) { const i = r.instance; if (i && typeof i === 'object') { try { if (pred(i)) return i; } catch {} } } return null; };
-        let modules = null, lastKey = '', requestedProfiles = new Set();
+        let modules = null, requestedProfiles = new Set();
         const loadModules = async () => {
           const io = pick((i) => typeof i.getFriendManagerModule === 'function');
           if (!io) return null;
@@ -221,37 +221,68 @@
           }
           return textOf(p.computedMessage) || textOf(p.message) || textOf(p.content) || LABEL_BY_TYPE[Number(p.messageType)] || '';
         };
+        // Preview text per preview item: the official formatter (plus the language lookups) runs for every conversation of the
+        // index on every tick otherwise, and a large account has thousands. The memo is keyed by the item object and checked
+        // against the fields a new message changes (time, ids, message / computedMessage identity, type); it is dropped as a
+        // whole every PREVIEW_MEMO_MS so names that resolve later still reach the text.
+        const PREVIEW_MEMO_MS = 20000;
+        let previewMemo = new WeakMap(), previewMemoBorn = 0;
+        const previewStamp = (p) => [p.messageTime, p.sendDttm, p.ts, p.msgId, p.cliMsgId, p.messageType, p.msgType].map((v) => (v === undefined || v === null ? '' : String(v))).join('|');
         const previewOf = (m, id) => {
           const p = safe(() => m.preview.data.get(id), null);
           if (!p) return null;
           // Preview items (preview-manager): {message, computedMessage, messageTime, fromUid ('0' = me), messageType}.
-          const text = safe(() => previewText(p), '') || '';
-          return { text: String(text).slice(0, 200), ts: Number(p.messageTime || p.sendDttm || p.ts || 0), fromMe: !!p.isMe || String(p.fromUid) === '0', type: p.messageType || p.msgType || '' };
+          const now = Date.now();
+          if (now - previewMemoBorn > PREVIEW_MEMO_MS) { previewMemo = new WeakMap(); previewMemoBorn = now; }
+          const stamp = previewStamp(p);
+          const hit = typeof p === 'object' ? previewMemo.get(p) : null;
+          let text;
+          if (hit && hit.stamp === stamp && hit.message === p.message && hit.computed === p.computedMessage) text = hit.text;
+          else {
+            text = String(safe(() => previewText(p), '') || '').slice(0, 200);
+            if (typeof p === 'object') previewMemo.set(p, { stamp, message: p.message, computed: p.computedMessage, text });
+          }
+          return { text, ts: Number(p.messageTime || p.sendDttm || p.ts || 0), fromMe: !!p.isMe || String(p.fromUid) === '0', type: p.messageType || p.msgType || '' };
         };
+        // Rows are posted as deltas: the first post carries every row with `reset: true`; later posts only the rows whose
+        // JSON changed since they were last posted, plus the ids that left the index (`removed`). Swift merges by id
+        // (ZaloEngine.mergeConversations), so a tick costs the bridge and the UI only what actually changed.
+        const posted = new Map();          // conv id → JSON of the row as last posted
+        let published = false;
         const publish = async () => {
           beginTick();
           if (!modules) { modules = await loadModules().catch(() => null); if (!modules || !modules.convs) { modules = null; return; } }
           const m = modules;
           const missing = [];
-          const rows = [];
+          const changed = [];
+          const seen = new Set();
           for (const [id, c] of m.convs.data) {
             const isGroup = !!c.isGroup;
             const name = safe(() => (isGroup ? m.groups.getDName(id) : m.friends.getDName(id)), '');
             if (!name && !isGroup) missing.push(id);
             const u = safe(() => m.unread.getUnreadByConvIdSync(id), null);
-            rows.push({
+            const row = {
               id: String(id), isGroup, name: name || '',
               avatar: safe(() => (isGroup ? m.groups.getAvatarGroup(id) : m.friends.getAvatar(id)), '') || '',
               pinned: !!c.pinned, members: isGroup ? safe(() => m.groups.getTotalMember(id), 0) : 0,
               unread: (u && (u.smsUnreadCount || 0)) || 0,
               preview: previewOf(m, id),
-            });
+            };
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
+            const key = JSON.stringify(row);
+            if (posted.get(row.id) !== key) { posted.set(row.id, key); changed.push(row); }
           }
+          const removed = [];
+          for (const id of posted.keys()) if (!seen.has(id)) removed.push(id);
+          removed.forEach((id) => posted.delete(id));
           // Unknown 1-1 names: ask the official friend module to fetch profiles once.
           const toFetch = missing.filter((id) => !requestedProfiles.has(id));
           if (toFetch.length) { toFetch.forEach((id) => requestedProfiles.add(id)); safe(() => m.friends.getProfileFriendByIds(toFetch), null); }
-          const key = JSON.stringify(rows);
-          if (key !== lastKey) { lastKey = key; post({ page: 'main', conversations: rows }); }
+          if (!published || changed.length || removed.length) {
+            post({ page: 'main', conversations: changed, removed, reset: !published });
+            published = true;
+          }
         };
         convTimer = setInterval(() => { publish().catch((e) => diag('conversations publish failed: ' + e)); }, 1500);
         publish().catch(() => {});

@@ -25,6 +25,20 @@ final class ZaloMainProcess {
     weak var host: OfficialClientHost?
     var onEvent: ((Event) -> Void)?
 
+    /// Where the official client's data access layer keeps its databases.
+    enum StorageBackend: String, Sendable {
+        /// The official "migration disabled" branch: IndexedDB in WebKit (Olaz before the SQLite host).
+        case indexedDB = "idb"
+        /// Native SQLite through `sqlite-host.js` + `SQLiteHost`, as Zalo PC 26.10 runs after its migration.
+        case sqlite
+    }
+    /// Chosen once per install (`olaz-storage.json`): installs that already hold IndexedDB data stay on it (the
+    /// official IndexedDB → SQLite migration needs Electron's SQLite window), fresh installs start on SQLite, and
+    /// `OLAZ_STORAGE=idb|sqlite` overrides for a run. `switchStorage` moves an install (its data starts over).
+    let storage: StorageBackend
+    /// The native SQLite executor behind `$znode.sqliteHost.*` (SQLite backend only).
+    let sqlite: SQLiteHost?
+
     /// Hidden `shared-worker.html` window (Electron's `dbTask` process) and the task router between windows.
     let sharedWorker = SharedWorkerRouter()
     /// Download manager of the main process (`new-download-channel`).
@@ -58,10 +72,16 @@ final class ZaloMainProcess {
 
     init(platform: ZaloPlatform) {
         self.platform = platform
-        // main `stop()`: the call helper does not outlive the app.
+        storage = Self.chooseStorage(platform: platform)
+        sqlite = storage == .sqlite ? SQLiteHost(root: platform.userData.appendingPathComponent("sqlite/_production", isDirectory: true)) : nil
+        mainLog.notice("storage backend: \(self.storage.rawValue, privacy: .public)")
+        // main `stop()`: the call helper and the fingerprint helper do not outlive the app.
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.callBridge?.shutdown() }
+            MainActor.assumeIsolated {
+                self?.callBridge?.shutdown()
+                FingerprintProxy.shared.shutdown()
+            }
         }
     }
 
@@ -69,6 +89,30 @@ final class ZaloMainProcess {
 
     var hasSession: Bool {
         HTTPCookieStorage.shared.cookies(for: Self.authDomain)?.contains { $0.name == "zpw_sek" && !$0.value.isEmpty } ?? false
+    }
+
+    // MARK: Storage backend
+
+    private static let storageStoreName = "olaz-storage"
+
+    static func chooseStorage(platform: ZaloPlatform) -> StorageBackend {
+        if let forced = ProcessInfo.processInfo.environment["OLAZ_STORAGE"].flatMap(StorageBackend.init(rawValue:)) { return forced }
+        let store = platform.readStore(storageStoreName)
+        if let saved = (store["backend"] as? String).flatMap(StorageBackend.init(rawValue:)) { return saved }
+        // An install that already ran the official client holds its data in IndexedDB; keep it readable.
+        let existing = FileManager.default.fileExists(atPath: platform.storeURL("database-config").path)
+        let chosen: StorageBackend = existing ? .indexedDB : .sqlite
+        try? platform.writeStore(storageStoreName, ["backend": chosen.rawValue, "chosenAt": Date().timeIntervalSince1970 * 1000])
+        return chosen
+    }
+
+    /// Records `backend` for the next launch. The official client then meets empty databases (the account's data is
+    /// not migrated between backends): the caller logs the account out so it starts over.
+    func switchStorage(_ backend: StorageBackend) {
+        try? platform.writeStore(Self.storageStoreName, ["backend": backend.rawValue, "chosenAt": Date().timeIntervalSince1970 * 1000])
+        var store = platform.readStore("database-config")
+        for key in store.keys where key.hasSuffix("adp-st") || key.localizedCaseInsensitiveContains("upgradeRequired") { store.removeValue(forKey: key) }
+        try? platform.writeStore("database-config", store)
     }
 
     /// Query string main appends to pages (`j6F3.qt`, spec §2.4).
@@ -117,7 +161,7 @@ final class ZaloMainProcess {
             }
         }
         worker.bridge.trace = { key, args in
-            guard !key.contains("ZLog"), !key.hasPrefix("$zelectron.store") else { return }
+            guard !key.contains("ZLog"), !key.hasPrefix("$zelectron.store"), !key.hasPrefix("$znode.sqliteHost") else { return }
             log.write("sw-bridge \(key)\(EngineLog.shape(args))")
         }
         worker.bridge.onHandlerError = { key, error in log.write("sw-bridge-error \(key): \(error.localizedDescription)") }
@@ -175,6 +219,8 @@ final class ZaloMainProcess {
     /// (`database-config` → `*adp-st`: `IDB = 0`, `SQLite = 1`) and drop
     /// `upgradeRequired`, which would force a migration.
     func normalizeDatabaseAdapterState() {
+        // SQLite backend: the renderer moves every adapter state to SQLite itself (`isMigrateFullDone` is true).
+        guard storage == .indexedDB else { return }
         var store = platform.readStore("database-config")
         var changed = false
         for (key, value) in store {
@@ -244,19 +290,23 @@ final class ZaloMainProcess {
         bridge.handle("get-photo-viewer-url") { _ in "\(OfficialClientHost.scheme)://local/popup-viewer.html" }
         bridge.handle("get-resource-dir") { _ in "\(OfficialClientHost.scheme)://local/" }
 
-        // Storage selection: force IndexedDB (spec §2.2, §4)
-        bridge.handle("sqlite-available") { _ in false }
+        // Storage selection (spec §2.2, §4). SQLite backend: the official "migration fully done" state, so every
+        // database adapter is SQLite and the DAL channel targets the utility process that sqlite-host.js plays.
+        // IndexedDB backend: the official "migration disabled" branch. `fail-load-sqlite3` stays true in both: the
+        // legacy message search index runs in its web worker (the native search binding is not provided).
+        let sqliteBackend = storage == .sqlite
+        bridge.handle("sqlite-available") { _ in sqliteBackend }
         bridge.handle("fail-load-sqlite3") { _ in true }
-        bridge.handle("is-migrate-full-done") { _ in false }
+        bridge.handle("is-migrate-full-done") { _ in sqliteBackend }
         bridge.handle("get-migrate-local-info") { _ in ["disable_migrate": true] }
         bridge.handle("migratedb:check_need_wait_bu") { _ in false }
         bridge.handle("z-db-corruption-detector") { _ in 0 }
-        bridge.handle("get-name-of-target-script-for-dal-channel-from-host") { _ in "preload-sqlite" }
+        bridge.handle("get-name-of-target-script-for-dal-channel-from-host") { _ in sqliteBackend ? "utility-process-sqlite" : "preload-sqlite" }
         // Electron relaunches the app here; the equivalent is reloading the page
         // after resetting the adapter state (no SQLite backend to migrate to).
         bridge.handle("migratedb:signal_restart") { [weak self] _ in
             guard let self else { return nil }
-            mainLog.notice("renderer requested restart for DB migration — reloading on IndexedDB")
+            mainLog.notice("renderer requested restart for DB migration — reloading on \(self.storage.rawValue, privacy: .public)")
             self.normalizeDatabaseAdapterState()
             if self.hasSession { self.startSharedWorker() } else { self.stopSharedWorker() }
             self.host?.load(self.hasSession ? .main : .login, query: self.pageQuery())
@@ -378,7 +428,7 @@ final class ZaloMainProcess {
         // Native helpers without a native module here: report "not supported" the
         // way main's mainless worker reports errors, so the renderer falls back.
         let unsupported: ZaloBridge.AsyncHandler = { _ in
-            ["error": ["name": "NotSupported", "message": "Not available in Olaz", "code": "ENOTSUP"]]
+            ["error": ["name": "NotSupported", "message": "Not supported", "code": "ENOTSUP"]]
         }
         bridge.handle("exec", unsupported)
         bridge.handle("exec_raw", unsupported)
@@ -422,7 +472,7 @@ final class ZaloMainProcess {
         // `$zFeatures.zaloCall.requestCompressedLogFile` feeds the call-log upload to Zalo's QoS server;
         // answered with the official error shape so the renderer skips the upload.
         bridge.handle("request-compressed-log-file") { _ in
-            ["status": 2, "data": ["message": "Not available in Olaz", "errorData": NSNull()]]
+            ["status": 2, "data": ["message": "Not supported", "errorData": NSNull()]]
         }
     }
 
@@ -444,6 +494,7 @@ final class ZaloMainProcess {
         callBridge?.reset()
         stopSharedWorker()
         sharedWorker.resetSession()
+        if let sqlite { Task { await sqlite.closeAll() } }
     }
 
     private func backToLogin() {

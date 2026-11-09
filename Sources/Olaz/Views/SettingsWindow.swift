@@ -97,6 +97,7 @@ private struct PrivacySettings: View {
 
 private struct AccountSettings: View {
     @Environment(ZaloEngine.self) private var engine
+    @State private var confirmSQLite = false
 
     var body: some View {
         Section {
@@ -133,6 +134,18 @@ private struct AccountSettings: View {
         Section("Engine") {
             LabeledContent("Giao thức") { Text("Zalo PC \(engine.clientVersion ?? "—") (mã chính thức)") }
             LabeledContent("Hội thoại") { Text(engine.conversationActions.hiddenKnown ? "\(engine.visibleConversations.count)" : "—") }
+            LabeledContent("Lưu trữ") {
+                Text(engine.storageBackend == .sqlite ? "SQLite (gốc)" : "IndexedDB (WebKit)")
+            }
+            if engine.storageBackend == .indexedDB {
+                Button("Chuyển sang SQLite…") { confirmSQLite = true }
+                    .confirmationDialog("Chuyển sang SQLite?", isPresented: $confirmSQLite, titleVisibility: .visible) {
+                        Button("Đăng xuất và chuyển", role: .destructive) { engine.switchToSQLite() }
+                        Button("Hủy", role: .cancel) {}
+                    } message: {
+                        Text("Tin nhắn đã lưu trên máy sẽ không được chuyển: sau khi đăng nhập lại, hãy đồng bộ tin nhắn từ điện thoại. SQLite nhanh hơn nhiều với tài khoản có nhiều tin nhắn.")
+                    }
+            }
         }
         Section {
             Button("Đăng xuất", role: .destructive) { engine.logOut() }

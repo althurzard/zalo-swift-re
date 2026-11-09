@@ -106,7 +106,13 @@ final class OfficialClientHost: NSObject {
             hostLog.fault("missing host script \(name, privacy: .public)")
             return ""
         }
+        #if DEBUG
         return source + "\n//# sourceURL=olaz-\(name).js"
+        #else
+        // Release: no sourceURL. The renderer's error stacks (which its log collector can upload)
+        // must not name third-party scripts; without it our frames show up anonymous.
+        return source
+        #endif
     }
 
     func load(_ page: Page, query: [String: String]) {
@@ -335,7 +341,7 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
         // sink for this worker is not persisted) — a forwarding call is added next to its logger.
         if path.hasPrefix("/sync-v2-sub-worker."), path.hasSuffix(".js"),
            let range = body.range(of: Data("return this.logger.zsymb(18,\"CytfSU\",".utf8)) {
-            body.insert(contentsOf: Data("self.__olazFwd&&self.__olazFwd('insertToDb-failed',e&&((e.name||'')+': '+(e.message||e)+' | '+String(e.stack||'').split('\\n').slice(0,6).join(' < ')));".utf8), at: range.lowerBound)
+            body.insert(contentsOf: Data("self.__zhostFwd&&self.__zhostFwd('insertToDb-failed',e&&((e.name||'')+': '+(e.message||e)+' | '+String(e.stack||'').split('\\n').slice(0,6).join(' < ')));".utf8), at: range.lowerBound)
         }
         #endif
         respond(task, url: url, data: body, mime: Self.mime(for: path))
@@ -419,7 +425,7 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
 
     /// Prepended to `dal-worker*.js`: finishes the sub-worker's DB-client setup (below) and forwards uncaught errors, console warnings/errors and
     /// IndexedDB request/transaction failures (name + message, no record data) to the page
-    /// (`network-shim.js` logs `__olazLog` messages).
+    /// (`network-shim.js` logs `__zhostLog` messages).
     static let workerPrelude: String = {
         var script = workerPreludeBase
         #if DEBUG
@@ -432,17 +438,17 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
       // Debug builds: a probe worker created from the dev eval channel can run code in this scope.
       self.addEventListener('message', async (e) => {
         const d = e.data;
-        if (!d || typeof d !== 'object' || typeof d.__olazEval !== 'string') return;
+        if (!d || typeof d !== 'object' || typeof d.__zhostEval !== 'string') return;
         e.stopImmediatePropagation();
-        try { const r = await (0, eval)(d.__olazEval); self.postMessage({ __olazEvalResult: JSON.stringify(r === undefined ? null : r) }); }
-        catch (err) { self.postMessage({ __olazEvalResult: JSON.stringify({ error: errText(err) }) }); }
+        try { const r = await (0, eval)(d.__zhostEval); self.postMessage({ __zhostEvalResult: JSON.stringify(r === undefined ? null : r) }); }
+        catch (err) { self.postMessage({ __zhostEvalResult: JSON.stringify({ error: errText(err) }) }); }
       });
     """
 
     static let workerPreludeBase = """
     (() => {
-      const fwd = (k, v) => { try { self.postMessage({ __olazLog: k + ' ' + String(v).slice(0, 300) }); } catch {} };
-      self.__olazFwd = fwd;
+      const fwd = (k, v) => { try { self.postMessage({ __zhostLog: k + ' ' + String(v).slice(0, 300) }); } catch {} };
+      self.__zhostFwd = fwd;
       /*DEBUG_EVAL*/
       const errText = (e) => e ? (e.name || '') + ': ' + (e.message || e) : String(e);
       self.addEventListener('error', (e) => fwd('error', e.message));

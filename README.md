@@ -108,8 +108,13 @@ ZaloMainProcess  ── Swift stand-in for Electron main.js: IPC channel handler
 * **Node parity**: `$znode.crypto` is reproduced on CommonCrypto/CryptoKit and verified
   byte-for-byte against Node (`Tests/OlazTests/RuntimeTests.swift`). The official
   client uses it to encrypt `zcid` and request params.
-* **Storage**: forced to IndexedDB (no native sqlite3): `fail_sqlite3=true`,
-  `canIUseSQLite→false`, `isMigrateFullDone→false`, as the spec prescribes.
+* **Storage**: native SQLite, as Zalo PC 26.10 runs after its IndexedDB → SQLite migration. The official data access
+  layer talks to its `utility-process-sqlite` over a MessagePort channel; `HostScripts/sqlite-host.js` plays that
+  process inside each page (channel broker + request protocol) and `ZaloRuntime/SQLiteHost.swift` executes the SQL on
+  the system SQLite (`<userData>/sqlite/_production/<db>.db`). Installs that already hold IndexedDB data stay on the
+  official "migration disabled" branch (`isMigrateFullDone→false`) until **Settings ▸ Engine ▸ Chuyển sang SQLite**;
+  `OLAZ_STORAGE=idb|sqlite` overrides for a run. The legacy message search index still runs in its web worker
+  (`fail_sqlite3=true`).
 * **JSBridge/**: standalone JavaScriptCore runtime + WebCrypto shim + libsignal E2EE
   module, for JS-only pieces that run outside the renderer.
 
@@ -133,7 +138,7 @@ ZaloMainProcess  ── Swift stand-in for Electron main.js: IPC channel handler
 | Hidden shared-worker window (Electron `sharedWorkerManager` port) | ✅ `ZaloRuntime/SharedWorkerRouter.swift` |
 | CDN media when system DNS fails `*.zadn.vn` | ✅ DNS-over-HTTPS fallback with pinned-SNI TLS (`ZaloRuntime/MediaLoader.swift`), Zalo hosts only |
 | Create group | 🧪 implemented over the official `createGroupV2` path, not yet verified against a live account |
-| Native SQLite backend (Zalo 26.10 migrates new sessions to SQLite) | ⏳ host stays on IndexedDB via the official "migration disabled" branch |
+| Native SQLite backend (Zalo 26.10 migrates new sessions to SQLite) | ✅ fresh installs; existing IndexedDB installs switch from Settings (no data migration: re-sync from the phone) |
 
 ## Reverse-engineering notes
 

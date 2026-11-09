@@ -106,6 +106,8 @@ enum OfficialZaloInstall {
     struct Info {
         let appURL: URL
         let version: String
+        /// The API client version this runtime's official main reports (User-Agent, `?client_version=`).
+        let clientVersion: String
         let asar: AsarArchive
     }
 
@@ -113,6 +115,20 @@ enum OfficialZaloInstall {
         let asarURL = appURL.appendingPathComponent("Contents/Resources/app.asar")
         let plist = NSDictionary(contentsOf: appURL.appendingPathComponent("Contents/Info.plist"))
         let version = plist?["CFBundleShortVersionString"] as? String ?? "?"
-        return Info(appURL: appURL, version: version, asar: try AsarArchive(url: asarURL))
+        let asar = try AsarArchive(url: asarURL)
+        let clientVersion = asar.read("main-dist/main.js").flatMap(Self.clientVersion(fromMainJS:))
+            ?? ClientFingerprint.defaultClientVersion
+        return Info(appURL: appURL, version: version, clientVersion: clientVersion, asar: asar)
+    }
+
+    /// `getClientVersion:function(){return 694}` in the main bundle — the number official main
+    /// puts in the User-Agent and the page query. Read from the runtime so a newer installed
+    /// runtime keeps reporting its own number instead of the pinned build's.
+    static func clientVersion(fromMainJS data: Data) -> String? {
+        guard let source = String(data: data, encoding: .utf8),
+              let regex = try? NSRegularExpression(pattern: #"getClientVersion:function\(\)\{return (\d+)\}"#),
+              let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)),
+              let range = Range(match.range(at: 1), in: source) else { return nil }
+        return String(source[range])
     }
 }

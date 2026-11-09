@@ -14,6 +14,9 @@ DerivedData/
 .vscode/
 .idea/
 
+# Fingerprint helper build output (scripts/build-fingerprint-helper.sh)
+FingerprintHelper/build/
+
 # Release artifacts (scripts/release.sh)
 dist/
 *.dmg

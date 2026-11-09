@@ -79,3 +79,46 @@ utility processes for SQLite and media, `mainless-worker`.
 `Assets/zalo-wordmark.svg`, `zalo-logo.png`, `avatar-default.png` extracted from `pc-dist/assets/`;
 `zalo.icns` from `Resources/`. Used for visual fidelity of the early recreation. These are VNG's assets: they are
 gitignored and **not part of the public repo** (Olaz ships its own artwork); extract them locally if needed.
+
+## SQLite host (DB 4.0 data access layer)
+
+Zalo PC 26.10 keeps every database in SQLite behind its data access layer (DAL). Pieces, all in `main-dist/`:
+`utility-process-sqlite.js` (the host: node-sqlite3 built with SQLCipher, one `.db` per database under
+`<userData>/<…>/_production/`), `main.js` (the MsgChannel broker between scripts), `preload-sqlite.js` + `sqlite.html`
+(the older in-window host and the IndexedDB → SQLite migration), `dal-worker.js` / `search-worker.js` /
+`sync-v2-sub-worker.js` (renderer-side DAL clients). Olaz reproduces the host (`HostScripts/sqlite-host.js` +
+`ZaloRuntime/SQLiteHost.swift`); what it speaks:
+
+- **Mode flags**: `$zFeatures.migrateDB.isMigrateFullDone → true` makes the adapter-state service (`adp-st` in the
+  `database-config` store, `0` IDB / `1` SQLite) move every database to SQLite; `$zdb.canIUseSQLite → true`;
+  `$zdb.getNameOfTargetScriptForDALChannelFromHost → "utility-process-sqlite"`. `fail_sqlite3=true` /
+  `checkFailedLoadSqlite → true` only steer the legacy search index to its web worker.
+- **Channel broker** (`$zMsgChannel`): `requestOpenChannelTo(current, target, channelID)` → main creates a
+  `MessageChannelMain` and pushes `port-transferred-v2` (SUBSCRIBE_V2 event with the port and
+  `{channelID, channelSessionID, isReconnect, nameOfCurrentScript, nameOfTargetScript}`) to both scripts; each answers
+  `notifyPortDelivered(current, target, channelID, sessionID)`; when both did, main pushes `channel-established`
+  `[current, target, channelID]`. The DAL channel id is `"dal"`; clients are `render`, `login`, `shared-worker`,
+  `search-worker`, `sync-v2-sub-workerDALWorker-1..3` (workers get their port relayed by the page). SUBSCRIBE_V2 in the
+  official preload passes `(key, event, …args)` and posts the ports separately as a `window.postMessage` from origin
+  `file://` with `{zChannelId: "__Z_I2M__", apiKey, key}`; the renderer's `$zsub` pairs the two by key.
+- **Port protocol**: `{"zmsg-port-msg-id": id, type: "invoke-msg-request", data, meta: {createdDttm}}` answered by
+  `{…, type: "invoke-msg-response", error, result, meta: {…, handledDttm}}`; a handler returning `"skip-handle-msg"`
+  sends nothing. `data = {typeID, data}` with typeIDs `SQL_STATEMENT`, `DAL_UTILITY` (`DAL_UTILITY/CLOSE_DB`,
+  `DELETE_DB`, `GET_PARTITION_KEYS`, `CLEAR_SESSIONAL_POOLS_UTILITY_TYPE_ID`, `CLEAR_ALL_POOLS_UTILITY_TYPE_ID`),
+  `BACK_UP`, `DB_CORRUPTION`, `DB_ENCRYPTION` (`…/CHECKSTT` → `"notStarted" | "running" | "finished"`), and the
+  host → client `NEED-SCHEMA-MIGRATION {fullname, currentVersion}`.
+- **SQL_STATEMENT**: `{connection: {fullname, cipherKey, version | null, sessional, transactionMode, poolType},
+  libMethod, statement}` with `libMethod` `run` (`statement: {query: {query, params: <count>}, params: [...], migrate}`
+  → `{lastID, changes}`, a failed UNIQUE constraint still resolves), `runs` (`params: [[...], …]`, one transaction),
+  `all` / `get` (rows as objects; `get` → `undefined` when none), `optimized-all` (`{queries: [{query, params}],
+  params: [[[...]]]}` → concatenated rows), `serialize` (`{data: [{method: "run"|"runs", query, params}], migrate}`,
+  one transaction). Results come back as `{result, connInfo?}`. Errors as node-sqlite3's `{errno, code, message}`.
+- **Schema versions**: when a pool opens, the host compares `PRAGMA user_version` with the requested version
+  (`null` = keep, floor 1) and, if different, invokes the requesting script with `NEED-SCHEMA-MIGRATION`; the renderer
+  runs its migration statements with `migrate: true` (they bypass the paused pool) and sets `PRAGMA user_version`
+  itself; everything else waits.
+- **Encryption**: the host opens a database with a SQLCipher key only once the official encryption job
+  (`DB_ENCRYPTION/START`) processed it. Olaz never starts that job, so its files are plain SQLite.
+- **Migration from IndexedDB**: the official path relaunches with `--db-migrate` and runs the copy inside
+  `sqlite.html` / `preload-sqlite.js` (Node). Not reproduced: an install moves to SQLite with empty databases and the
+  phone → PC sync brings history back.

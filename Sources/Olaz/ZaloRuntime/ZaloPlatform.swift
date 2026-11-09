@@ -13,17 +13,20 @@ final class ZaloPlatform {
     /// Values the Electron main process passes to renderer pages.
     struct ClientIdentity {
         /// `type` query parameter of the macOS client.
-        var clientType = "23"
-        var clientVersion = "694"
+        var clientType = ClientFingerprint.clientType
+        var clientVersion = ClientFingerprint.defaultClientVersion
     }
 
     let appVersion: String
-    let identity = ClientIdentity()
+    let identity: ClientIdentity
     let userData: URL
     let fileManager = FileManager.default
 
-    init(appVersion: String, userData: URL = ZaloPlatform.defaultUserData) {
+    init(appVersion: String,
+         clientVersion: String = ClientFingerprint.defaultClientVersion,
+         userData: URL = ZaloPlatform.defaultUserData) {
         self.appVersion = appVersion
+        self.identity = ClientIdentity(clientType: ClientFingerprint.clientType, clientVersion: clientVersion)
         self.userData = userData
         try? fileManager.createDirectory(at: userData, withIntermediateDirectories: true)
     }

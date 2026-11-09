@@ -139,7 +139,14 @@
     homedir: () => info.homedir || '/', tmpdir: () => info.tmpdir || '/tmp', endianness: () => 'LE',
     totalmem: () => info.totalmem || 0, freemem: () => info.freemem || 0, uptime: () => info.uptime || 0,
     cpus: () => Array.from({ length: info.cpus || 1 }, () => ({ model: info.cpuModel || 'Apple', speed: 0, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } })),
-    loadavg: () => [0, 0, 0], networkInterfaces: () => ({}),
+    loadavg: () => [0, 0, 0],
+    // [name, [addresses…]] pairs (getifaddrs order) → Node's { en0: […] } shape; a fresh object
+    // per call, like Node's. The official QoS code takes the first non-internal IPv4 as local IP.
+    networkInterfaces: () => {
+      const out = {};
+      for (const [name, addrs] of (info.networkInterfaces ? JSON.parse(info.networkInterfaces) : [])) out[name] = addrs;
+      return out;
+    },
     userInfo: () => ({ username: info.username || '', homedir: info.homedir || '/', shell: '/bin/zsh', uid: 501, gid: 20 }),
   };
 
@@ -211,7 +218,7 @@
   });
 
   // ---- Native-module features without a native module here (spec §1.4) ----
-  const unsupported = (name) => () => Promise.reject(Object.assign(new Error(name + ' is not available in Olaz'), { code: 'ENOTSUP' }));
+  const unsupported = (name) => () => Promise.reject(Object.assign(new Error("Cannot find module '" + name + "'"), { code: 'MODULE_NOT_FOUND' }));
 
   // ---- MetriczGlobal: process stats ----
   const metrics = {
@@ -226,7 +233,7 @@
   // index and the phone-backup reader. This host has no SQLite backend (storage is forced to
   // IndexedDB), so every call fails the way a missing native lib does; the bundle only needs
   // the global to exist when its modules load.
-  const noSqlite = (what) => Promise.reject(Object.assign(new Error('SQLite is not available in Olaz (' + what + ')'), { code: 'ENOTSUP' }));
+  const noSqlite = (what) => Promise.reject(Object.assign(new Error('SQLite is not available (' + what + ')'), { code: 'ENOTSUP' }));
   const sqliteMethods = ['openDb', 'query', 'queryV2', 'queryGlobalMessage', 'queryGlobalMessageV2', 'queryGlobalMessageV3', 'queryGlobalMessageV4',
     'deleteRow', 'deleteRows', 'write', 'writev2', 'pureQuery', 'prepareInsertSearch', 'prepareDeleteSearch', 'getConversationMatch', 'flushDb',
     'flushDbBatchv2', 'flushDbBatch', 'closeDb', 'finalizeInsertStatement', 'finalizeDeleteStatement', 'doListSqls', 'createKey', 'initDebug', 'countTotal'];
