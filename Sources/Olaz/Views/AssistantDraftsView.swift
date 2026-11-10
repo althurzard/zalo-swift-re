@@ -18,11 +18,22 @@ struct AssistantDraftsView: View {
                                                                           : "Bật Trợ lý AI trong Cài đặt để nhận nháp."))
                     .frame(maxHeight: .infinity)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(Array(shown)) { DraftCard(draft: $0, desk: desk) }
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(Array(shown)) { draft in
+                                DraftCard(draft: draft, desk: desk)
+                                    .overlay(RoundedRectangle(cornerRadius: 12)
+                                        .strokeBorder(.tint, lineWidth: desk.focusedDraftId == draft.id ? 2 : 0))
+                                    .id(draft.id)
+                            }
+                        }
+                        .padding(12)
                     }
-                    .padding(12)
+                    .onChange(of: desk.focusedDraftId, initial: true) { _, id in
+                        guard let id else { return }
+                        withAnimation { proxy.scrollTo(id, anchor: .top) }
+                    }
                 }
             }
         }

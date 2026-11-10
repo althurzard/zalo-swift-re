@@ -53,6 +53,17 @@ final class AssistantDesk {
     }
 
     private(set) var drafts: [Draft] = []
+    /// Set to ask the UI to show the "Duyệt nháp" window (a draft notification was clicked); the window clears it.
+    var revealRequest: String?
+    /// The draft the review window should scroll to / highlight.
+    var focusedDraftId: String?
+
+    static let notificationPrefix = "olaz.assistant."
+
+    func reveal(draftId: String?) {
+        focusedDraftId = draftId
+        revealRequest = UUID().uuidString
+    }
     private(set) var isListening = false
     private(set) var lastError: String?
     /// Kill switch: while paused nothing queued goes out (proposals still arrive).
@@ -367,6 +378,7 @@ final class AssistantDesk {
         content.title = "Nháp trả lời chờ duyệt"
         content.body = "\(draft.conversationName): \(draft.text.prefix(120))"
         content.threadIdentifier = "olaz.assistant"
+        content.userInfo = ["convId": draft.conversationId, "draftId": draft.id]
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "olaz.assistant.\(draft.id)", content: content, trigger: nil))
     }
 

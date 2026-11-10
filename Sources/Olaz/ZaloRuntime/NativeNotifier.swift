@@ -442,6 +442,11 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
                     if !(NSApp.isActive && engine?.openConversationId == convId) { await postSendFailure(convId: convId) }
                 }
             }
+        case UNNotificationDefaultActionIdentifier where id.hasPrefix(AssistantDesk.notificationPrefix):
+            // A draft awaiting review: open its conversation and the review window on that draft.
+            bringAppToFront()
+            if !convId.isEmpty { engine?.navigationRequest = convId }
+            engine?.assistant.reveal(draftId: String(id.dropFirst(AssistantDesk.notificationPrefix.count)))
         case UNNotificationDefaultActionIdentifier:
             bringAppToFront()
             if !convId.isEmpty { engine?.navigationRequest = convId }

@@ -29,6 +29,7 @@ struct SidebarView: View {
         List(selection: selection) {
             mailboxes(counts)
             storage
+            assistant
             contacts
         }
         .listStyle(.sidebar)
@@ -95,6 +96,21 @@ struct SidebarView: View {
                 .padding(.top, 2)
                 .selectionDisabled()
                 .accessibilityElement(children: .combine)
+            }
+        }
+    }
+
+    /// "Trợ lý AI": opens the draft review window (a window of its own, not a list destination).
+    @ViewBuilder private var assistant: some View {
+        let desk = engine.assistant
+        if desk.isListening || !desk.drafts.isEmpty {
+            Section("Trợ lý AI") {
+                Button { desk.reveal(draftId: nil) } label: {
+                    Label("Duyệt nháp", systemImage: "text.bubble")
+                }
+                .buttonStyle(.plain)
+                .badge(desk.pendingCount)
+                .selectionDisabled()
             }
         }
     }

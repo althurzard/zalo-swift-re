@@ -44,6 +44,7 @@ struct RootView: View {
             }
         }
         .animation(.smooth(duration: 0.4), value: route)
+        .modifier(AssistantRevealer())
         // Incoming calls also ring during the first-run setup, so the banner / alerts sit around every route.
         .callOverlay()
         .onChange(of: engine.phase, initial: true) { _, phase in
@@ -201,5 +202,19 @@ private extension View {
     func fullBleedWindow() -> some View {
         toolbar(removing: .title)
             .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+    }
+}
+
+/// Opens the "Duyệt nháp" window when the assistant asks for it (draft notification, sidebar row).
+private struct AssistantRevealer: ViewModifier {
+    @Environment(ZaloEngine.self) private var engine
+    @Environment(\.openWindow) private var openWindow
+
+    func body(content: Content) -> some View {
+        content.onChange(of: engine.assistant.revealRequest) { _, request in
+            guard request != nil else { return }
+            openWindow(id: "assistant-drafts")
+            engine.assistant.revealRequest = nil
+        }
     }
 }
