@@ -93,6 +93,8 @@ final class ZaloEngine {
     internal(set) var hasMoreHistory: [String: Bool] = [:]
     /// Bumped when an older page arrived whose messages are all hidden cards (nothing else in `messages` changes), so the list can ask for the next page.
     internal(set) var historyTicks: [String: Int] = [:]
+    /// Bumped each time an `open` finished loading the conversation's last messages (JS `loaded` marker).
+    @ObservationIgnored internal(set) var loadedTicks: [String: Int] = [:]
     /// Who is typing per conversation (display name), cleared after a few seconds.
     internal(set) var typing: [String: String] = [:]
     /// Phone → PC message transfer, nil when none is in progress / offered.

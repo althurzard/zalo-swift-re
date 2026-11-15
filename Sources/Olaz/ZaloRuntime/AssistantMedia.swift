@@ -22,9 +22,8 @@ enum AssistantMedia {
     typealias Err = AssistantDesk.AssistantError
 
     static func view(_ engine: ZaloEngine, conversationId: String, messageId: String, frames: Int) async throws -> [String: Any] {
-        if (engine.messages[conversationId] ?? []).isEmpty, engine.openConversationId != conversationId {
-            engine.navigationRequest = conversationId
-            for _ in 0..<40 where (engine.messages[conversationId] ?? []).isEmpty { try? await Task.sleep(for: .milliseconds(250)) }
+        if engine.messages[conversationId]?.contains(where: { $0.id == messageId }) != true {
+            await AssistantDesk.loadHistory(engine, conversationId, atLeast: 0)
         }
         guard let message = engine.messages[conversationId]?.first(where: { $0.id == messageId }) else {
             throw Err("Không thấy tin \(messageId) — gọi read_messages trước")

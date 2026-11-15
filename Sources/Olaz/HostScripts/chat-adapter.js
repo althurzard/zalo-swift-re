@@ -1292,7 +1292,17 @@
         // Every exit lets go of `openingId` unless a newer open / close owns it now (stale).
         if (!stale()) openingId = null;
       }
-      if (!stale()) remapAll();
+      if (!stale()) {
+        remapAll();
+        // Flush now (not on the 150 ms tick) so the marker below follows the loaded list: a reader that
+        // waits for `loaded` (the assistant) sees the history, not just the preview the store had before.
+        if (timer) { clearTimeout(timer); timer = null; }
+        flush();
+        const conv = convOf(convId);
+        if (track.id === convId && conv) {
+          post({ page: 'main', chat: { convId, messages: [], removed: [], hasMore: hasMoreOf(conv), reset: false, loaded: true } });
+        }
+      }
     },
     async close(convId) {
       convId = String(convId);

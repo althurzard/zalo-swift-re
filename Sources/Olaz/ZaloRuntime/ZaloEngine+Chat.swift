@@ -5,7 +5,7 @@ import AppKit
 // Contract: ChatModels.swift. All actions run through the official client's own services.
 extension ZaloEngine {
     func openConversation(_ id: String) {
-        if openConversationId != id { dropMessagePrompts() }
+        if openConversationId != id { dropMessagePrompts(); loadedTicks[id] = nil }
         openConversationId = id
         callChat("open", id)
         callChat("watchPins", id, object: "__zaloMsgActions")
@@ -63,6 +63,7 @@ extension ZaloEngine {
         messages = [:]
         hasMoreHistory = [:]
         historyTicks = [:]
+        loadedTicks = [:]
         typing = [:]
         ChatTypingClock.tasks.values.forEach { $0.cancel() }
         ChatTypingClock.tasks = [:]
@@ -149,6 +150,7 @@ extension ZaloEngine {
         notePollMessages(incoming)
         if let hasMore = chat["hasMore"] as? Bool, hasMoreHistory[convId] != hasMore { hasMoreHistory[convId] = hasMore }
         if chat["grew"] as? Bool == true { historyTicks[convId, default: 0] += 1 }
+        if chat["loaded"] as? Bool == true { loadedTicks[convId, default: 0] += 1 }
         if typing[convId] != nil, let newest = incoming.last, !newest.isMine, newest.date > Date().addingTimeInterval(-5) {
             clearTyping(convId)
         }

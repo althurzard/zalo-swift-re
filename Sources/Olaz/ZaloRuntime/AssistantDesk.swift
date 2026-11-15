@@ -178,9 +178,7 @@ final class AssistantDesk {
             let convId = try string(p, "conversationId")
             guard engine.conversations.contains(where: { $0.id == convId }) else { throw AssistantError("Không thấy hội thoại \(convId)") }
             let limit = min(p["limit"] as? Int ?? 30, 100)
-            // Messages are only synced for the conversation on screen: open it (the reviewer sees what the AI reads).
-            if engine.openConversationId != convId { engine.navigationRequest = convId }
-            for _ in 0..<40 where (engine.messages[convId] ?? []).isEmpty { try? await Task.sleep(for: .milliseconds(250)) }
+            await Self.loadHistory(engine, convId, atLeast: limit)
             let list = (engine.messages[convId] ?? []).suffix(limit)
             return list.map { m -> [String: Any] in
                 var row: [String: Any] = ["id": m.id, "from": m.isMine ? "me" : m.senderName, "isMine": m.isMine,
@@ -245,6 +243,34 @@ final class AssistantDesk {
         default:
             throw AssistantError("Không hỗ trợ: \(method)")
         }
+    }
+
+    /// Messages are only synced for the conversation on screen: open it (the reviewer sees what the AI reads) and wait
+    /// until its open finished loading history — not just until the list is non-empty, since the first list posted on
+    /// open is often only the preview message the store already had. Then page older history until `atLeast` are there.
+    static func loadHistory(_ engine: ZaloEngine, _ convId: String, atLeast want: Int) async {
+        if engine.openConversationId != convId || engine.loadedTicks[convId] == nil {
+            let before = engine.loadedTicks[convId] ?? 0
+            if engine.openConversationId != convId { engine.navigationRequest = convId }
+            await Self.wait(48) { engine.openConversationId == convId && (engine.loadedTicks[convId] ?? 0) > before }
+            // No marker (older adapter / slow load): fall back to anything at all.
+            await Self.wait(8) { !(engine.messages[convId] ?? []).isEmpty }
+        }
+        for _ in 0..<3 {
+            let count = engine.messages[convId]?.count ?? 0
+            guard count < want, engine.hasMoreHistory[convId] == true, engine.openConversationId == convId else { break }
+            let ticks = engine.historyTicks[convId] ?? 0
+            engine.loadOlderMessages(convId)
+            await Self.wait(40) {
+                (engine.messages[convId]?.count ?? 0) > count || (engine.historyTicks[convId] ?? 0) > ticks
+                    || engine.hasMoreHistory[convId] != true
+            }
+        }
+    }
+
+    /// Polls `done` every 250 ms, at most `ticks` times.
+    private static func wait(_ ticks: Int, until done: () -> Bool) async {
+        for _ in 0..<ticks where !done() { try? await Task.sleep(for: .milliseconds(250)) }
     }
 
     private func propose(_ engine: ZaloEngine, convId: String, text raw: String, quote: String?, note: String,
