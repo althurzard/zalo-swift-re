@@ -187,25 +187,12 @@ struct FriendsList: View {
     @Environment(ZaloEngine.self) private var engine
     @Environment(ShellModel.self) private var shell
     @State private var query = ""
-
-    private var sections: [(letter: String, friends: [ContactsState.Friend])] {
-        let q = ZaloEngine.contactFold(query).trimmingCharacters(in: .whitespaces)
-        let matches = q.isEmpty ? engine.visibleFriends : engine.visibleFriends.filter {
-            $0.sortKey.contains(q) || ZaloEngine.contactFold($0.zaloName).contains(q)
-        }
-        let grouped = Dictionary(grouping: matches, by: \.section)
-        return grouped.keys.sorted { a, b in
-            if a == "#" { return false }
-            if b == "#" { return true }
-            return a < b
-        }.map { letter in
-            (letter, grouped[letter, default: []].sorted { $0.sortKey.localizedStandardCompare($1.sortKey) == .orderedAscending })
-        }
-    }
+    /// Folding and sorting thousands of friends is not redone on every render: only when the friends or the query change.
+    @State private var cache = FriendSections()
 
     var body: some View {
         @Bindable var shell = shell
-        let sections = sections
+        let sections = cache.sections(friends: engine.visibleFriends, query: query)
         Group {
             if !engine.contacts.friendsLoaded || !engine.conversationActions.hiddenKnown {
                 ContactsLoading(text: "Đang tải danh sách bạn bè…")
@@ -246,6 +233,42 @@ struct FriendsList: View {
                 .padding(.horizontal, 12).padding(.bottom, 6)
         }
         .columnTitle("Bạn bè", subtitle: "\(engine.visibleFriends.count) bạn bè")
+    }
+}
+
+/// The alphabetical sections of `FriendsList`, kept for the friends and query they were built from.
+@MainActor
+private final class FriendSections {
+    typealias Section = (letter: String, friends: [ContactsState.Friend])
+
+    private var friends: [ContactsState.Friend]?
+    private var query = ""
+    private var built: [Section] = []
+    /// Folded Zalo names by friend id, with the name they were folded from (folding creates a `Locale` per call).
+    private var foldedZaloNames: [String: (name: String, folded: String)] = [:]
+
+    func sections(friends: [ContactsState.Friend], query: String) -> [Section] {
+        if let cached = self.friends, cached == friends, self.query == query { return built }
+        self.friends = friends
+        self.query = query
+        let q = ZaloEngine.contactFold(query).trimmingCharacters(in: .whitespaces)
+        let matches = q.isEmpty ? friends : friends.filter { $0.sortKey.contains(q) || foldedZaloName($0).contains(q) }
+        let grouped = Dictionary(grouping: matches, by: \.section)
+        built = grouped.keys.sorted { a, b in
+            if a == "#" { return false }
+            if b == "#" { return true }
+            return a < b
+        }.map { letter in
+            (letter, grouped[letter, default: []].sorted { $0.sortKey.localizedStandardCompare($1.sortKey) == .orderedAscending })
+        }
+        return built
+    }
+
+    private func foldedZaloName(_ friend: ContactsState.Friend) -> String {
+        if let cached = foldedZaloNames[friend.id], cached.name == friend.zaloName { return cached.folded }
+        let folded = ZaloEngine.contactFold(friend.zaloName)
+        foldedZaloNames[friend.id] = (friend.zaloName, folded)
+        return folded
     }
 }
 

@@ -128,7 +128,10 @@ final class ZaloEngine {
     /// zCloud: plan, quota / usage, conversations with cloud data, settings (ZaloEngine+Cloud.swift).
     internal(set) var cloud = CloudState()
     /// Voice / video calls: renderer support, native helper status, incoming call (ZaloEngine+CallHook.swift).
-    internal(set) var call = CallState()
+    internal(set) var call = CallState() {
+        // The incoming call ended, was missed / dismissed or replaced: its macOS banner goes too (ZaloEngine+CallHook.swift).
+        didSet { if let old = oldValue.incoming, old.id != call.incoming?.id { withdrawIncomingCallBanner(old.id) } }
+    }
     /// Group polls read from the official poll service, by poll id (ZaloEngine+Poll.swift).
     internal(set) var polls = PollStore()
     /// Composer "+" actions (ZaloEngine+Composer.swift): an official confirm asked during a send, a screenshot to share, the
@@ -149,6 +152,8 @@ final class ZaloEngine {
     internal(set) var pins: [String: PinnedList] = [:]
     /// Message actions in flight ("conv|msg|action"): a second click while one runs is ignored.
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
+    /// Unsent composer text per conversation, kept while switching conversations (ZaloEngine+Drafts.swift). In memory only.
+    @ObservationIgnored internal var conversationDrafts = ConversationDraftStore()
 
     /// AI assistant channel (proposals only; the user approves every send). See AssistantDesk.swift.
     let assistant = AssistantDesk()
@@ -169,6 +174,8 @@ final class ZaloEngine {
     func start() {
         guard host == nil, runtimeInstall == nil else { return }
         ZaloRuntime.prepareForLaunch()
+        // Screenshots of an earlier run (crash, quit mid-upload) do not outlive their hour.
+        Task.detached(priority: .utility) { ScreenCapture.pruneOldShots() }
         guard ZaloRuntime.isComplete(ZaloRuntime.current), let install = try? OfficialZaloInstall.locate() else {
             installRuntime()
             return
@@ -307,10 +314,44 @@ final class ZaloEngine {
     func logOut() {
         ZaloMainProcess.clearCookies()
         mainProcess?.resetAccountState()
+        resetAccountState()
+        refreshQR()
+    }
+
+    /// Logout (from this app or the server's): every per-account value goes, so nothing of the previous account — messages,
+    /// contacts, mutes, drafts, banners, a transfer or call prompt — shows up in, or acts for, the next one. Device-level
+    /// values (runtime phase, macOS permission, native call-helper process, engine log) stay.
+    private func resetAccountState() {
         profile = nil
+        // Conversation list.
         conversations = []
         conversationIndex = [:]
+        selfConversationId = nil
+        navigationRequest = nil
+        conversationExtras = ConversationExtras()
         resetConversationActions()
+        // Chat.
+        openConversationId = nil
+        resetChatState()
+        failedDrafts = FailedDraftStore()   // unsent text of the previous account must not show up in the next one
+        conversationDrafts = ConversationDraftStore()
+        transfer = nil
+        canStartTransfer = false
+        transferStartBlockedReason = nil
+        // Features.
+        contacts = ContactsState()
+        var notifications = NotificationSettingsState()   // mutes and official settings are the account's
+        notifications.authorization = notificationSettings.authorization
+        notificationSettings = notifications
+        var calls = CallState()                            // keep only what describes the native helper process
+        calls.helperInstalled = call.helperInstalled
+        calls.helperProblem = call.helperProblem
+        calls.nativeRunning = call.nativeRunning
+        calls.nativePID = call.nativePID
+        calls.nativeState = call.nativeState
+        call = calls
+        CardActionCenter.shared.reset()
+        resetCardState()
         resetCloud()
         resetPolls()
         resetStickers()
@@ -318,8 +359,8 @@ final class ZaloEngine {
         resetMessageActions()
         resetPrivacyState()
         MessageTranslationStore.shared.clearAll()
-        failedDrafts = FailedDraftStore()   // unsent text of the previous account must not show up in the next one
-        refreshQR()
+        mediaResolver.reset()
+        NativeNotifier.shared.resetForLogout()
     }
 
     func applyProfile(_ next: Profile) {
@@ -336,18 +377,8 @@ final class ZaloEngine {
             signOutNotice = nil
             phase = .signingIn
         case .loggedOut:
-            profile = nil
-            CardActionCenter.shared.reset()
-            resetCardState()
-            resetConversationActions()
-            resetCloud()
-            resetPolls()
-            resetStickers()
-            resetComposer()
-            resetMessageActions()
-            resetPrivacyState()
-            MessageTranslationStore.shared.clearAll()
-            failedDrafts = FailedDraftStore()
+            // `ZaloMainProcess.backToLogin` already reset its own account state and loads the login page.
+            resetAccountState()
             phase = .login(LoginState())
         case .badge:
             break
@@ -538,13 +569,56 @@ final class ZaloEngine {
         let rows = (state["conversations"] as? [[String: Any]] ?? []).compactMap(Self.conversation)
         let reset = state["reset"] as? Bool ?? (state["removed"] == nil)
         let removed = state["removed"] as? [String] ?? []
-        var index = reset ? [:] : conversationIndex
-        for id in removed { index.removeValue(forKey: id) }
-        for row in rows { index[row.id] = row }
-        guard reset || index != conversationIndex else { return }
-        conversationIndex = index
-        let sorted = index.values.sorted(by: Self.listOrder)
-        if sorted != conversations { conversations = sorted }
+        if reset {
+            var index: [String: ConversationSummary] = [:]
+            for row in rows { index[row.id] = row }
+            conversationIndex = index
+            let sorted = index.values.sorted(by: Self.listOrder)
+            if sorted != conversations { conversations = sorted }
+            return
+        }
+        // Delta: only the touched rows are compared, and only rows whose place can change (new, gone, or a different pin /
+        // last-activity date / name) are taken out and binary-inserted again — no full re-sort with `localizedCompare`.
+        var original: [String: ConversationSummary?] = [:]
+        for id in removed where original[id] == nil { original[id] = .some(conversationIndex[id]) }
+        for id in removed { conversationIndex.removeValue(forKey: id) }
+        for row in rows {
+            if original[row.id] == nil { original[row.id] = .some(conversationIndex[row.id]) }
+            conversationIndex[row.id] = row
+        }
+        var drop = Set<String>(), insert: [ConversationSummary] = [], replace: [String: ConversationSummary] = [:]
+        for (id, before) in original {
+            let after = conversationIndex[id]
+            guard before != after else { continue }
+            if let before, let after, !Self.orderChanged(before, after) {
+                replace[id] = after
+            } else {
+                if before != nil { drop.insert(id) }
+                if let after { insert.append(after) }
+            }
+        }
+        guard !drop.isEmpty || !insert.isEmpty || !replace.isEmpty else { return }
+        var list = conversations
+        if !drop.isEmpty { list.removeAll { drop.contains($0.id) } }
+        if !replace.isEmpty {
+            for i in list.indices { if let row = replace[list[i].id] { list[i] = row } }
+        }
+        for row in insert.sorted(by: Self.listOrder) {
+            var low = 0, high = list.count
+            while low < high {
+                let mid = (low + high) / 2
+                if Self.listOrder(row, list[mid]) { high = mid } else { low = mid + 1 }
+            }
+            list.insert(row, at: low)
+        }
+        // Backstop: the list must hold exactly the index (a drift would otherwise stay until the next reset).
+        if list.count != conversationIndex.count { list = conversationIndex.values.sorted(by: Self.listOrder) }
+        if list != conversations { conversations = list }
+    }
+
+    /// Whether a row's place in `listOrder` can differ between two versions of it.
+    private static func orderChanged(_ a: ConversationSummary, _ b: ConversationSummary) -> Bool {
+        a.pinned != b.pinned || a.preview?.date != b.preview?.date || a.displayName != b.displayName
     }
 
     private static func conversation(_ row: [String: Any]) -> ConversationSummary? {

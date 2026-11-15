@@ -280,16 +280,17 @@ private struct FoundUserCard: View {
                         .scrollContentBackground(.hidden)
                         .frame(height: 78)
                         .onChange(of: message) { _, new in
-                            if new.count > user.maxMessage { message = String(new.prefix(user.maxMessage)) }
+                            // UTF-16 units, like the official limit (an emoji counts 2).
+                            if new.utf16.count > user.maxMessage { message = new.limitedUTF16(user.maxMessage) }
                         }
-                    Text("\(message.count)/\(user.maxMessage)")
+                    Text("\(message.utf16.count)/\(user.maxMessage)")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 Section {
                     Button {
                         sending = true
-                        engine.sendFriendRequest(to: user.id, message: message)
+                        engine.sendFriendRequest(to: user.id, message: message.prefixUTF16(user.maxMessage))
                     } label: {
                         if sending { ProgressView().controlSize(.small) } else { Label("Gửi lời mời kết bạn", systemImage: "person.badge.plus") }
                     }

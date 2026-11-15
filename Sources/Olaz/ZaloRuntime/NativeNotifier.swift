@@ -115,6 +115,8 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     static let messageCategory = "app.olaz.message"
     static let replyAction = "app.olaz.message.reply"
+    /// Identifier prefix of the native incoming-call banners (`call-<uuid>`).
+    static let callPrefix = "call-"
     /// Title of the development renderer window — never the user-facing window.
     private static let debugWindowTitle = "Zalo renderer (debug)"
 
@@ -166,6 +168,32 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         live[id] = nil
     }
 
+    /// Logout: nothing of the previous account may stay on screen, in Notification Center, or answer a click / inline reply.
+    func resetForLogout() {
+        live = [:]
+        orphanDrafts = FailedDraftStore()
+        knownHidden = []
+        guard let center else { return }
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
+    }
+
+    /// Removes these banners (delivered or still pending), e.g. an incoming-call banner once the call rang out.
+    func removeNotifications(withIdentifiers ids: [String]) {
+        guard let center, !ids.isEmpty else { return }
+        center.removeDeliveredNotifications(withIdentifiers: ids)
+        center.removePendingNotificationRequests(withIdentifiers: ids)
+    }
+
+    /// The account a banner was posted for (`userInfo["account"]`) must be the one signed in now; a banner without one
+    /// (posted before this check existed) or posted while no account was known never acts.
+    private func belongsToCurrentAccount(_ account: String) -> Bool {
+        guard !account.isEmpty, let current = engine?.profile?.userId, !current.isEmpty else { return false }
+        return account == current
+    }
+
+    private var currentAccount: String { engine?.profile?.userId ?? "" }
+
     /// Drops the banners of a conversation the user has now opened.
     func clearDelivered(conversation id: String) {
         guard isAvailable, !id.isEmpty else { return }
@@ -194,6 +222,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
             appIsActive: NSApp.isActive, mainWindowVisible: mainWindow()?.isVisible == true && mainWindow()?.isMiniaturized == false,
             openConversation: engine?.openConversationId, tag: request.tag, userIdleSeconds: Self.userIdleSeconds()) {
             notifierLog.info("notification suppressed: conversation is open and the app is in use")
+            live[id] = nil
             return
         }
 
@@ -203,14 +232,24 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.body = NotificationPolicy.body(request.body, showsPreview: showsPreview)
         content.threadIdentifier = request.tag.isEmpty ? "zalo" : request.tag
         content.categoryIdentifier = Self.messageCategory
-        content.userInfo = ["convId": request.tag, "id": id]
+        let account = currentAccount
+        content.userInfo = ["convId": request.tag, "id": id, "account": account]
         if !request.silent { content.sound = .default }
-        if let attachment = await avatarAttachment(for: request.icon) { content.attachments = [attachment] }
+        let avatar = await avatarAttachment(for: request.icon)
+        if let avatar { content.attachments = [avatar.attachment] }
+        // Logged out (or another account signed in) while the avatar loaded: not the current account's banner any more.
+        guard account == currentAccount else {
+            if let avatar { try? FileManager.default.removeItem(at: avatar.file) }
+            live[id] = nil
+            return
+        }
 
         do {
             try await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         } catch {
             notifierLog.error("add notification failed: \(error.localizedDescription, privacy: .public)")
+            // The center did not take the attachment: its temp file is ours to remove.
+            if let avatar { try? FileManager.default.removeItem(at: avatar.file) }
             live[id] = nil
             return
         }
@@ -221,7 +260,8 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func avatarAttachment(for icon: NativeNotificationRequest.Icon?) async -> UNNotificationAttachment? {
+    /// The avatar as an attachment, with the temp file it was written to (removed by the caller if the center never takes it).
+    private func avatarAttachment(for icon: NativeNotificationRequest.Icon?) async -> (attachment: UNNotificationAttachment, file: URL)? {
         guard let icon else { return nil }
         let data: Data?
         switch icon {
@@ -240,8 +280,9 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         do {
             try data.write(to: file)
             // The center moves the file into its own store; remove stragglers if it did not.
-            return try UNNotificationAttachment(identifier: "avatar", url: file,
-                                                options: [UNNotificationAttachmentOptionsTypeHintKey: kind.type.identifier])
+            let attachment = try UNNotificationAttachment(identifier: "avatar", url: file,
+                                                          options: [UNNotificationAttachmentOptionsTypeHintKey: kind.type.identifier])
+            return (attachment, file)
         } catch {
             try? FileManager.default.removeItem(at: file)
             return nil
@@ -288,7 +329,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         content.title = "Chưa gửi được tin nhắn trả lời"
         content.body = "Nội dung được giữ lại trong ô soạn thảo của hội thoại. Mở để gửi lại."
         content.threadIdentifier = convId
-        content.userInfo = ["convId": convId]
+        content.userInfo = ["convId": convId, "account": currentAccount]
         do { try await center.add(UNNotificationRequest(identifier: "sendfail-" + UUID().uuidString, content: content, trigger: nil)) }
         catch { notifierLog.error("send-failure notification failed: \(error.localizedDescription, privacy: .public)") }
     }
@@ -417,20 +458,38 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         let identifier = response.notification.request.identifier
         let convId = response.notification.request.content.userInfo["convId"] as? String ?? ""
+        let account = response.notification.request.content.userInfo["account"] as? String ?? ""
         let action = response.actionIdentifier
         let text = (response as? UNTextInputNotificationResponse)?.userText
         await MainActor.run {
-            NativeNotifier.shared.handleResponse(id: identifier, convId: convId, action: action, text: text)
+            NativeNotifier.shared.handleResponse(id: identifier, convId: convId, account: account, action: action, text: text)
         }
     }
 
-    private func handleResponse(id: String, convId: String, action: String, text: String?) {
+    private func handleResponse(id: String, convId: String, account: String, action: String, text: String?) {
+        // Incoming-call banner (ZaloEngine+CallHook): not an official notification — the renderer never hears of it.
+        if id.hasPrefix(Self.callPrefix) {
+            if action == UNNotificationDefaultActionIdentifier {
+                bringAppToFront()
+                engine?.showCallWindow()
+            }
+            return
+        }
+        // A banner of another account (or of none known): no reply is sent, nothing is opened, the renderer is not told.
+        guard belongsToCurrentAccount(account) else {
+            notifierLog.info("notification response ignored: not the signed-in account")
+            if action == UNNotificationDefaultActionIdentifier { bringAppToFront() }
+            live[id] = nil
+            removeNotifications(withIdentifiers: [id])
+            return
+        }
         let entry = live[id]
         switch action {
         case Self.replyAction:
             // Inline reply goes through the official send path; the app stays in the background.
             if let text, !convId.isEmpty {
                 Task {
+                    guard belongsToCurrentAccount(account) else { return }
                     // A locked hidden chat (or an unknown hidden state) is never written to from a banner: the text takes the failure path.
                     let refused = engine.map { NotificationPolicy.refusesReply(hiddenStateKnown: $0.conversationActions.hiddenKnown,
                                                                                conversationLocked: $0.isConversationLocked(convId)) } ?? true

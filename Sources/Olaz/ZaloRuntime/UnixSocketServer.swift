@@ -17,6 +17,8 @@ final class UnixSocketServer: @unchecked Sendable {
 
     let path: String
     private let queue: DispatchQueue
+    /// Marks `queue`, so `stop()` can tell it already runs there (see `stop`).
+    private let queueKey = DispatchSpecificKey<Bool>()
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var connections: [Int: (fd: Int32, source: DispatchSourceRead)] = [:]
@@ -30,6 +32,7 @@ final class UnixSocketServer: @unchecked Sendable {
     init(path: String) {
         self.path = path
         queue = DispatchQueue(label: "app.olaz.unix-socket." + (path as NSString).lastPathComponent)
+        queue.setSpecific(key: queueKey, value: true)
     }
 
     deinit { stop() }
@@ -89,14 +92,22 @@ final class UnixSocketServer: @unchecked Sendable {
     }
 
     func stop() {
-        queue.sync {
-            for id in Array(connections.keys) { closeConnection(id, notify: false) }
-            acceptSource?.cancel()
-            acceptSource = nil
-            if listenFD >= 0 {
-                listenFD = -1
-                unlink(path)
-            }
+        // The last reference can drop inside one of our own queue blocks (`[weak self]` upgraded there), running
+        // `deinit` → `stop()` on `queue`: a `queue.sync` from there traps (deadlock), so clean up in place.
+        if DispatchQueue.getSpecific(key: queueKey) == true {
+            stopOnQueue()
+        } else {
+            queue.sync { stopOnQueue() }
+        }
+    }
+
+    private func stopOnQueue() {
+        for id in Array(connections.keys) { closeConnection(id, notify: false) }
+        acceptSource?.cancel()
+        acceptSource = nil
+        if listenFD >= 0 {
+            listenFD = -1
+            unlink(path)
         }
     }
 

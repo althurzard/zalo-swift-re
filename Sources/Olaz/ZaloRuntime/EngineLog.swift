@@ -10,7 +10,7 @@ final class EngineLog {
     static let shared = EngineLog()
 
     let url: URL
-    private var handle: FileHandle?
+    private let writer: Writer
     private let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -32,20 +32,14 @@ final class EngineLog {
             : ZaloPlatform.defaultUserData.deletingLastPathComponent().appendingPathComponent("logs", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         url = dir.appendingPathComponent("engine.log")
-        // Keep the previous run for comparison; cap size.
-        let fm = FileManager.default
-        if let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int, size > 0 {
-            let previous = dir.appendingPathComponent("engine.previous.log")
-            try? fm.removeItem(at: previous)
-            try? fm.moveItem(at: url, to: previous)
-        }
-        fm.createFile(atPath: url.path, contents: nil)
-        handle = try? FileHandle(forWritingTo: url)
+        writer = Writer(url: url, previous: dir.appendingPathComponent("engine.previous.log"))
+        // Keep the previous run for comparison (nothing else touches the writer yet, so no queue hop).
+        writer.rotate(force: false)
     }
 
     func write(_ line: String) {
         let text = "\(formatter.string(from: .now)) \(line.prefix(1500))\n"
-        handle?.write(Data(text.utf8))
+        writer.append(Data(text.utf8))
     }
 
     /// Argument summary without values: `(string, object{3}, bytes[512])`.
@@ -61,5 +55,52 @@ final class EngineLog {
             default: "\(type(of: arg))"
             }
         }.joined(separator: ", ") + ")"
+    }
+
+    /// The file side, confined to `queue`: callers (mostly the main thread) never wait for disk I/O, a full disk only
+    /// drops lines (the throwing `write(contentsOf:)`, not the legacy `write(_:)` that raises an ObjC exception), and a
+    /// long session cannot grow the file without bound.
+    private final class Writer: @unchecked Sendable {
+        /// Rotate (to `engine.previous.log`) once the current file passes this size.
+        static let maxBytes = 20 << 20
+
+        let queue = DispatchQueue(label: "app.olaz.engine-log", qos: .utility)
+        let url: URL
+        let previous: URL
+        private var handle: FileHandle?
+        private var size = 0
+
+        init(url: URL, previous: URL) {
+            self.url = url
+            self.previous = previous
+        }
+
+        func append(_ data: Data) {
+            queue.async { [self] in
+                if size + data.count > Self.maxBytes { rotate(force: true) }
+                guard let handle else { return }
+                do {
+                    try handle.write(contentsOf: data)
+                    size += data.count
+                } catch {
+                    // Disk full / file gone: drop the line (diagnostics only).
+                }
+            }
+        }
+
+        /// On `queue` (or before first use). Moves a non-empty current file to `previous` (only when over the cap unless at launch, where
+        /// `force` is false and any content belongs to the previous run) and opens a fresh one.
+        func rotate(force: Bool) {
+            let fm = FileManager.default
+            try? handle?.close()
+            handle = nil
+            if let current = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int, current > 0 || force {
+                try? fm.removeItem(at: previous)
+                try? fm.moveItem(at: url, to: previous)
+            }
+            fm.createFile(atPath: url.path, contents: nil)
+            handle = try? FileHandle(forWritingTo: url)
+            size = 0
+        }
     }
 }

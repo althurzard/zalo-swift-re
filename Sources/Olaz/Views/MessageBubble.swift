@@ -144,7 +144,22 @@ private extension View {
     /// Carries the coach mark of the tour's "message" step (the newest message of the chat). It sits in a background so the row
     /// keeps its identity when a newer message takes the mark over.
     func messageTourAnchor(_ active: Bool) -> some View {
-        background { if active { Color.clear.tourAnchor(.message, arrowEdge: .trailing) } }
+        modifier(MessageTourAnchor(active: active))
+    }
+}
+
+/// Attaches the anchor only while the tour's "message" step runs. Outside the tour the newest row would otherwise carry a
+/// popover plus appear/disappear hooks that write to the anchor registry; inside the lazy message stack those hooks fire on
+/// every cell re-insertion, and when an album lands (rows re-laid out while the newest row moves) that fed an endless
+/// layout loop (main thread stuck in `_layoutSubtreeWithOldSize`, then AppKit's "too many update constraints" crash).
+private struct MessageTourAnchor: ViewModifier {
+    @Environment(ShellModel.self) private var shell
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        content.background {
+            if active, shell.tour == .message { Color.clear.tourAnchor(.message, arrowEdge: .trailing) }
+        }
     }
 }
 

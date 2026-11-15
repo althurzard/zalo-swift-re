@@ -300,11 +300,14 @@ final class ScreenCapture {
         return rep.representation(using: .png, properties: [:])
     }
 
-    /// Shots live in the temporary directory, one folder each (the page reads them while it uploads); older ones are removed.
-    static let directory = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-screenshots", isDirectory: true)
+    /// Shots live in the temporary directory, one folder each (the page reads them while it uploads); ones older than
+    /// `shotLifetime` are removed on every write and at launch (`pruneOldShots`).
+    nonisolated static let directory = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-screenshots", isDirectory: true)
+    /// Long enough for any upload of the shot to finish; screenshots are private and must not pile up in /tmp.
+    nonisolated static let shotLifetime: TimeInterval = 3600
 
     static func writeShot(_ png: Data) -> URL? {
-        prune()
+        pruneOldShots()
         let folder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let url = folder.appendingPathComponent("screenshot.png")
         do {
@@ -321,10 +324,11 @@ final class ScreenCapture {
         return writeShot(png)
     }
 
-    private static func prune() {
+    /// Removes shots older than `shotLifetime` (called at launch from `ZaloEngine.start()` and before each write).
+    nonisolated static func pruneOldShots() {
         let fm = FileManager.default
         guard let folders = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.creationDateKey]) else { return }
-        let cutoff = Date().addingTimeInterval(-6 * 3600)
+        let cutoff = Date().addingTimeInterval(-shotLifetime)
         for folder in folders {
             let created = (try? folder.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
             if created < cutoff { try? fm.removeItem(at: folder) }

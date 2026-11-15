@@ -216,8 +216,12 @@ extension FingerprintProxy {
         /// the frame end, finishes a stream); websocket messages are reassembled and delivered
         /// whole.
         private func deliverBinary(_ id: String, _ piece: Data, complete: Bool) {
-            if activeStreams[id] != nil {
-                activeStreams[id]?.yield(.chunk(piece))
+            // `activeStreams` is mutated from other threads (`cancel`, `startStreamBody`): read it under the lock.
+            stateLock.lock()
+            let stream = activeStreams[id]
+            stateLock.unlock()
+            if let stream {
+                stream.yield(.chunk(piece))
             } else if wsMessageKind[id] != nil {
                 var message = wsPartial[id] ?? Data()
                 message.append(piece)
@@ -331,6 +335,11 @@ extension FingerprintProxy {
         private func startStreamBody(_ id: String, _ head: ResponseHead) {
             guard let pendingHead = takePending(&pendingStreamHeads, id: id) else { return }
             let (stream, bodyContinuation) = AsyncThrowingStream<StreamEvent, Swift.Error>.makeStream()
+            // A consumer that stops iterating (task cancelled, stream dropped) must stop the upstream transfer too
+            // (`.finished` = END / ERR / socket loss already removed the entry: nothing to cancel).
+            bodyContinuation.onTermination = { [weak self] termination in
+                if case .cancelled = termination { self?.cancel(id) }
+            }
             stateLock.lock()
             activeStreams[id] = bodyContinuation
             stateLock.unlock()

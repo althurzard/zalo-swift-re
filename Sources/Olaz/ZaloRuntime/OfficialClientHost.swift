@@ -81,16 +81,25 @@ final class OfficialClientHost: NSObject {
         let content = config.userContentController
         content.add(consoleHandler, name: ConsoleHandler.name)
         content.add(stateHandler, name: StateHandler.name)
-        content.addScriptMessageHandler(network, contentWorld: .page, name: NetworkProxy.handlerName)
-        content.addScriptMessageHandler(bridge, contentWorld: .page, name: ZaloBridge.handlerName)
+        // Issue #1: the native bridges answer only the renderer's own documents (see `admits`).
+        content.addScriptMessageHandler(AppOriginReplyHandler(network), contentWorld: .page, name: NetworkProxy.handlerName)
+        content.addScriptMessageHandler(AppOriginReplyHandler(bridge), contentWorld: .page, name: ZaloBridge.handlerName)
         let diagnostics = ProcessInfo.processInfo.environment["OLAZ_TRACE_WORKERS"] != nil ? "window.__zaloTraceWorkers = true;" : ""
+        // Still injected into subframes (same-origin frames of the renderer keep the `$z*` globals), but each script
+        // is guarded to run only in app-origin documents: a cross-origin (https) frame keeps its native fetch/XHR/
+        // WebSocket instead of a shim whose bridge would refuse it.
         for script in [diagnostics, ConsoleHandler.script, Self.hostScript("network-shim"), bridge.specScript(), Self.hostScript("local-modules"), Self.hostScript("bridge"), Self.hostScript("sqlite-host"), Self.hostScript("state-adapter"), Self.hostScript("chat-adapter"), Self.hostScript("media-store-adapter"), Self.hostScript("card-actions-adapter"), Self.hostScript("sticker-adapter"), Self.hostScript("composer-adapter"), Self.hostScript("message-actions-adapter"), Self.hostScript("transfer-adapter"), Self.hostScript("conversations-adapter"), Self.hostScript("conversation-actions-adapter"), Self.hostScript("contacts-adapter"), Self.hostScript("group-create-adapter"), Self.hostScript("notification-adapter"), Self.hostScript("profile-adapter"), Self.hostScript("privacy-adapter"), Self.hostScript("zcloud-adapter"), Self.hostScript("poll-adapter"), Self.hostScript("call-adapter")] {
-            content.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            content.addUserScript(WKUserScript(source: Self.appDocumentsOnly(script), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
 
         webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1100, height: 720), configuration: config)
         webView.customUserAgent = ua
+        // Issue #1.5: Web Inspector only in debug builds, or on explicit request (OLAZ_INSPECT=1).
+        #if DEBUG
         webView.isInspectable = true
+        #else
+        webView.isInspectable = ProcessInfo.processInfo.environment["OLAZ_INSPECT"] == "1"
+        #endif
         super.init()
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -98,6 +107,48 @@ final class OfficialClientHost: NSObject {
         schemeHandler.bridge = bridge
         network.webView = webView
         bridge.webView = webView
+    }
+
+    nonisolated static let appHost = "local"
+    /// How WebKit serializes the renderer's origin (`window.origin`, the `Origin` request header).
+    nonisolated static let appOrigin = "zalo-app://local"
+
+    /// Whether a frame's origin is the renderer's own (`zalo-app://local`): the main frame and its same-origin
+    /// subframes (about:blank / srcdoc frames inherit it). Cross-origin frames (https login pages, data: frames…)
+    /// must not reach the native bridges.
+    static func isAppOrigin(_ origin: WKSecurityOrigin) -> Bool {
+        origin.protocol.lowercased() == scheme && origin.host.lowercased() == appHost
+    }
+
+    private static var refusedOrigins: Set<String> = []
+
+    /// Gate for every script message handler; refusals are logged once per (handler, origin).
+    static func admits(_ message: WKScriptMessage) -> Bool {
+        let origin = message.frameInfo.securityOrigin
+        if isAppOrigin(origin) { return true }
+        let who = "\(origin.protocol)://\(origin.host)\(origin.port == 0 ? "" : ":\(origin.port)")"
+        if refusedOrigins.insert("\(message.name) \(who)").inserted {
+            hostLog.error("refused \(message.name, privacy: .public) message from \(who, privacy: .public) (main frame: \(message.frameInfo.isMainFrame))")
+            EngineLog.shared.write("host: refused \(message.name) message from frame origin \(who)")
+        }
+        return false
+    }
+
+    /// Wraps a host script (all are single IIFEs, so a block changes no bindings) to run only in app-origin documents.
+    static func appDocumentsOnly(_ script: String) -> String {
+        guard !script.isEmpty else { return script }
+        let guardExpr = """
+        (() => { try {
+          const p = location.protocol;
+          if (p === '\(scheme):') return true;
+          if (p === 'blob:') return location.href.startsWith('blob:\(appOrigin)/');
+          if (p !== 'about:') return false;
+          let w = window;
+          while (w !== w.top && w.location.protocol === 'about:') w = w.parent;
+          return w.location.protocol === '\(scheme):';
+        } catch (e) { return false; } })()
+        """
+        return "if (\(guardExpr)) {\n\(script)\n}\n"
     }
 
     static func hostScript(_ name: String) -> String {
@@ -119,7 +170,7 @@ final class OfficialClientHost: NSObject {
         currentPage = page
         var components = URLComponents()
         components.scheme = Self.scheme
-        components.host = "local"
+        components.host = Self.appHost
         components.path = "/" + page.rawValue
         components.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         hostLog.info("loading \(page.rawValue, privacy: .public)")
@@ -215,7 +266,10 @@ extension OfficialClientHost: WKUIDelegate {
 }
 
 extension OfficialClientHost: WKNavigationDelegate {
+    /// Main frame only (WebKit reports no provisional navigations of subframes here): the page going away owns
+    /// sockets whose ids the next page restarts from 1 — drop them before it loads.
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        network.closeAllSockets()
         onPageEvent?(.startedLoading)
     }
 
@@ -231,18 +285,26 @@ extension OfficialClientHost: WKNavigationDelegate {
         onPageEvent?(.failed(error))
     }
 
-    /// Only the renderer's own pages load in this view; links open in the browser.
+    /// Only the renderer's own pages load in this view; links open in the browser. Subframes may also load https
+    /// (login / OAuth pages); being cross-origin, they cannot reach the bridges (`admits`). Other schemes
+    /// (http, file, custom URL schemes…) are refused in subframes.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let url = action.request.url else { return .cancel }
-        if url.scheme == Self.scheme || url.scheme == "about" || url.scheme == "blob" || url.scheme == "data" { return .allow }
-        if action.targetFrame?.isMainFrame == false { return .allow }
-        if ["http", "https"].contains(url.scheme ?? "") { NSWorkspace.shared.open(url) }
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == Self.scheme || scheme == "about" || scheme == "blob" || scheme == "data" { return .allow }
+        if action.targetFrame?.isMainFrame == false {
+            if scheme == "https" { return .allow }
+            hostLog.notice("subframe navigation refused (scheme \(scheme, privacy: .public))")
+            return .cancel
+        }
+        if ["http", "https"].contains(scheme) { NSWorkspace.shared.open(url) }
         return .cancel
     }
 
-    /// Electron's renderer process can crash; WebKit's content process too. Reload.
+    /// Electron's renderer process can crash; WebKit's content process too. Drop the dead page's sockets, reload.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         hostLog.error("web content process terminated — reloading")
+        network.closeAllSockets()
         webView.reload()
     }
 }
@@ -269,9 +331,18 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
         guard let url = task.request.url else { return }
         // Same-origin endpoint: index.html's CSP (`connect-src 'self' …`) blocks other hosts.
         if url.path() == Self.bridgeSyncPath {
+            // Issue #1: a cross-origin frame can send a CORS "simple" POST here (text body, no preflight); such a
+            // request always carries its `Origin`. The renderer's own XHRs carry `zalo-app://local` or none.
+            if let origin = task.request.value(forHTTPHeaderField: "Origin"),
+               origin.lowercased() != OfficialClientHost.appOrigin {
+                hostLog.error("bridge-sync refused for origin \(origin, privacy: .public)")
+                task.didReceive(HTTPURLResponse(url: url, statusCode: 403, httpVersion: "HTTP/1.1", headerFields: [:])!)
+                task.didFinish()
+                return
+            }
             let body = task.request.httpBody ?? Data()
             let data = MainActor.assumeIsolated { bridge?.handleSyncRequest(body) } ?? Data("{}".utf8)
-            respond(task, url: url, data: data, mime: "application/json")
+            respond(task, url: url, data: data, mime: "application/json", crossOrigin: false)
             return
         }
         if url.path() == Self.pendingFilesPath || url.path().hasPrefix(Self.pendingFilesPrefix) {
@@ -504,13 +575,13 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {}
 
-    private func respond(_ task: any WKURLSchemeTask, url: URL, data: Data, mime: String) {
-        let headers = [
+    private func respond(_ task: any WKURLSchemeTask, url: URL, data: Data, mime: String, crossOrigin: Bool = true) {
+        var headers = [
             "Content-Type": mime,
             "Content-Length": "\(data.count)",
-            "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-cache",
         ]
+        if crossOrigin { headers["Access-Control-Allow-Origin"] = "*" }
         task.didReceive(HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!)
         task.didReceive(data)
         task.didFinish()
@@ -529,6 +600,28 @@ final class AsarSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 }
 
+// MARK: - Frame-origin gate for the native bridges (issue #1)
+
+/// Forwards `znet` / `zbridge` messages only from app-origin frames; others get an error reply.
+@MainActor
+private final class AppOriginReplyHandler: NSObject, WKScriptMessageHandlerWithReply {
+    let inner: any WKScriptMessageHandlerWithReply
+
+    init(_ inner: any WKScriptMessageHandlerWithReply) { self.inner = inner }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
+    ) {
+        guard OfficialClientHost.admits(message) else {
+            replyHandler(nil, "EACCES: native bridge not available in this frame")
+            return
+        }
+        inner.userContentController(userContentController, didReceive: message, replyHandler: replyHandler)
+    }
+}
+
 // MARK: - Console / error capture
 
 private final class ConsoleHandler: NSObject, WKScriptMessageHandler {
@@ -544,6 +637,7 @@ private final class ConsoleHandler: NSObject, WKScriptMessageHandler {
     var sink: ((String) -> Void)?
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard MainActor.assumeIsolated({ OfficialClientHost.admits(message) }) else { return }
         let line = "\(message.body)"
         hostLog.debug("\(line, privacy: .private)")
         sink?(line)
@@ -555,6 +649,8 @@ private final class StateHandler: NSObject, WKScriptMessageHandler {
     var sink: (([String: Any]) -> Void)?
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        // Snapshots drive the native UI: a cross-origin frame must not be able to forge them.
+        guard MainActor.assumeIsolated({ OfficialClientHost.admits(message) }) else { return }
         if let state = message.body as? [String: Any] { sink?(state) }
     }
 }

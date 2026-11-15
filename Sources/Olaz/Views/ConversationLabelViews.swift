@@ -180,10 +180,11 @@ private struct LabelEditor: View {
                     .focused($focused)
                     .onSubmit(submit)
                     .onChange(of: name) { _, value in
-                        if value.count > extras.limits.maxNameLength { name = String(value.prefix(extras.limits.maxNameLength)) }
+                        // UTF-16 units, like the official limit (an emoji counts 2).
+                        if value.utf16.count > extras.limits.maxNameLength { name = value.limitedUTF16(extras.limits.maxNameLength) }
                         error = nil
                     }
-                Text("\(name.count)/\(extras.limits.maxNameLength)").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Text("\(name.utf16.count)/\(extras.limits.maxNameLength)").font(.system(size: 11)).foregroundStyle(.tertiary)
             }
             VStack(alignment: .leading, spacing: 8) {
                 Text("Màu").font(.system(size: 12)).foregroundStyle(.secondary)
@@ -225,7 +226,9 @@ private struct LabelEditor: View {
         guard !trimmed.isEmpty, !submitting else { return }
         submitting = true
         baseSeq = extras.notice?.seq ?? 0
-        if let existing { engine.updateConversationLabel(existing.id, name: trimmed, colorHex: colorHex) }
-        else { engine.createConversationLabel(name: trimmed, colorHex: colorHex) }
+        // The field may still be over the limit if it was left while composing.
+        let clamped = trimmed.prefixUTF16(extras.limits.maxNameLength)
+        if let existing { engine.updateConversationLabel(existing.id, name: clamped, colorHex: colorHex) }
+        else { engine.createConversationLabel(name: clamped, colorHex: colorHex) }
     }
 }

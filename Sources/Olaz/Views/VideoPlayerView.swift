@@ -112,13 +112,28 @@ final class VideoPlayback {
         resumeAfterScrub = false
         isScrubbing = false
         hideTask?.cancel()
+        removeObservers()
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        isPlaying = false
+    }
+
+    /// The periodic time observer and the end notification. Idempotent: `stop()` and `deinit` both call it.
+    private func removeObservers() {
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+    }
+
+    /// A playback dropped without `stop()` (a view torn down without `onDisappear`, a replaced preview) must not leave
+    /// the player's observers and tasks behind. Observed state is not touched here.
+    isolated deinit {
+        loadTask?.cancel()
+        seekTask?.cancel()
+        hideTask?.cancel()
+        removeObservers()
         player.pause()
-        player.replaceCurrentItem(with: nil)
-        isPlaying = false
     }
 
     // MARK: Transport

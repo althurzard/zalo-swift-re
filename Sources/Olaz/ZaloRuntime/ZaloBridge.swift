@@ -153,6 +153,12 @@ final class ZaloBridge: NSObject, WKScriptMessageHandlerWithReply {
         didReceive message: WKScriptMessage,
         replyHandler: @escaping @MainActor @Sendable (Any?, String?) -> Void
     ) {
+        // Issue #1: only the renderer's own frames (app origin) reach main-process handlers. `OfficialClientHost`
+        // already registers this handler behind the same gate; checked again here so no registration can skip it.
+        guard OfficialClientHost.admits(message) else {
+            replyHandler(nil, "EACCES: native bridge not available in this frame")
+            return
+        }
         guard let body = message.body as? [String: Any], let kind = body["kind"] as? String else {
             replyHandler(nil, "bad bridge message")
             return

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ImageIO
 
 // Sheets of the composer's "+" menu: my contact card, a new reminder, and the conversation picker of the screenshot tool's
 // "Chia sẻ". They gather what the official modals gather; sending goes through `ZaloEngine+Composer.swift`.
@@ -102,6 +103,8 @@ struct ReminderComposeSheet: View {
     @State private var confirmDiscard = false
     /// Re-evaluates "is the time still in the future" while the sheet stays open.
     @State private var now = Date()
+    /// Created once per sheet, not on every `body` evaluation.
+    private let clock = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
 
     private var trimmed: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var issue: String? {
@@ -122,7 +125,7 @@ struct ReminderComposeSheet: View {
             }
         }
         .frame(width: 440)
-        .onReceive(Timer.publish(every: 20, on: .main, in: .common).autoconnect()) { now = $0 }
+        .onReceive(clock) { now = $0 }
         .confirmationDialog("Bạn muốn huỷ nhắc hẹn đang được tạo?", isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Hủy thay đổi", role: .destructive) { dismiss() }
             Button("Không", role: .cancel) {}
@@ -214,6 +217,8 @@ struct ScreenshotShareSheet: View {
     @State private var selected: [String] = []
     @State private var busy = false
     @State private var message: String?
+    /// The screenshot, decoded once (downsampled) instead of on every `body` evaluation.
+    @State private var picture: NSImage?
 
     private var rows: [ZaloEngine.ConversationSummary] {
         let all = engine.visibleConversations.sorted { ($0.preview?.date ?? .distantPast) > ($1.preview?.date ?? .distantPast) }
@@ -242,10 +247,14 @@ struct ScreenshotShareSheet: View {
             }
         }
         .frame(width: 440, height: 560)
+        .task(id: share.image) {
+            picture = nil
+            if let image = share.image { picture = await PreviewImage.load(image, maxPixel: 880) }
+        }
     }
 
     @ViewBuilder private var preview: some View {
-        if let image = share.image, let picture = NSImage(contentsOf: image) {
+        if share.image != nil, let picture {
             Image(nsImage: picture).resizable().scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: 120)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -914,5 +923,23 @@ struct SpreadsheetPasteChoiceSheet: View {
                 errorMessage = "Không gửi được văn bản. Bạn có thể bấm \"Chèn chữ vào ô nhập\" để thử lại."
             }
         }
+    }
+}
+
+// MARK: - Preview image
+
+/// A downsampled picture for a sheet's preview: the file is read off the main actor, and only a thumbnail is decoded
+/// (a full-resolution screenshot is never decoded for a 120 pt preview).
+enum PreviewImage {
+    @MainActor static func load(_ url: URL, maxPixel: Int) async -> NSImage? {
+        let data = await Task.detached(priority: .userInitiated) { try? Data(contentsOf: url) }.value
+        guard !Task.isCancelled, let data, let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: .zero)
     }
 }

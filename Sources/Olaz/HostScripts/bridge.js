@@ -122,6 +122,17 @@
     }
   }
 
+  // Undeclared members are logged once per path, with the argument types / lengths only (never values: paths, ids, tokens).
+  // They keep resolving `undefined` rather than rejecting: a rejection would abort official init chains that await them
+  // without a catch, and the log shows the only undeclared calls the renderer makes are coercion probes (toString / valueOf).
+  const missingLogged = new Set();
+  const shapeOf = (a) => (a === null ? 'null' : Array.isArray(a) ? 'array[' + a.length + ']' : typeof a === 'string' ? 'string[' + a.length + ']'
+    : a instanceof ArrayBuffer || ArrayBuffer.isView(a) ? 'bytes[' + a.byteLength + ']' : typeof a);
+  const noteMissing = (kind, path, args) => {
+    if (missingLogged.has(path) || missingLogged.size > 500) return;
+    missingLogged.add(path);
+    log('[bridge:missing]', kind, path, '(' + args.map(shapeOf).join(',') + ')');
+  };
   function member(path) {
     if (spec.ipc && spec.ipc[path]) return ipcMember(path, spec.ipc[path]);
     const mode = spec.members[path];
@@ -136,9 +147,10 @@
         case 'noop': return undefined;
         case 'noop-async': return Promise.resolve(undefined);
         default:
-          if (/^(on|once)[A-Z]/.test(name)) return subscribe(path, args);
+          // An undeclared event: the page listens, Swift never emits it.
+          if (/^(on|once)[A-Z]/.test(name)) { noteMissing('event', path, args); return subscribe(path, args); }
           if (/^remove(Listen|Listener)/.test(name)) return unsubscribe(path, args);
-          log('[bridge:missing]', path, JSON.stringify(encode(args.filter((a) => typeof a !== 'function'))).slice(0, 200));
+          noteMissing('call', path, args);
           // Most preload members wrap ipcRenderer.invoke (→ Promise); *Sync members return plain values.
           if (/Sync$/.test(name)) return undefined;
           { const cb = args.find((a) => typeof a === 'function'); if (cb) setTimeout(() => cb(null)); }

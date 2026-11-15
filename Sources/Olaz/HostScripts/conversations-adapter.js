@@ -105,12 +105,14 @@
     };
   };
   // `ConvList.sortConvId(ids, false, true)` — the sort the official STRANGER filter applies.
-  let convListUtil = null;
+  // A miss is not rescanned on every snapshot: the next full module scan waits 1 s, then twice as long after each miss, up to 30 s.
+  let convListUtil = null, sortScanAt = 0, sortScanGap = 1000;
   const sortConvIds = (ids) => {
-    if (!convListUtil) {
+    if (!convListUtil && Date.now() >= sortScanAt) {
       window.__zaloEachExport(window.__zaloRequire, (ex) => {
         try { if (!convListUtil && ex && ex !== window.$capp && ex.ConvList && typeof ex.ConvList.sortConvId === 'function' && Function.prototype.toString.call(ex.ConvList.sortConvId).includes('getConvByIdSync')) convListUtil = ex.ConvList; } catch {}
       });
+      if (!convListUtil) { sortScanAt = Date.now() + sortScanGap; sortScanGap = Math.min(sortScanGap * 2, 30000); }
     }
     const out = convListUtil ? convListUtil.sortConvId(ids.slice(), false, true) : null;
     return Array.isArray(out) ? out : null;
@@ -119,7 +121,7 @@
   const publish = (force) => {
     if (!resolve()) return;
     let snap;
-    try { snap = snapshot(); } catch (e) { diag('snapshot failed: ' + e); return; }
+    try { snap = snapshot(); } catch (e) { diag('snapshot failed: ' + (e && e.name ? e.name : typeof e)); return; }
     const key = JSON.stringify(snap);
     if (!force && key === lastKey) return;
     lastKey = key;

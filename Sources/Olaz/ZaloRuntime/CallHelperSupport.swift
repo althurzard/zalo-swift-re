@@ -64,22 +64,36 @@ enum CallOrphans {
     @discardableResult
     static func reap(helperExecutable: URL) -> [pid_t] {
         let helperPath = helperExecutable.resolvingSymlinksInPath().path
-        var reaped: [pid_t] = []
+        var reaped: [(pid: pid_t, argv: [String])] = []
         for pid in allPIDs() where pid != getpid() {
-            var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0,
-                  URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().path == helperPath,
-                  owner(of: pid) == getuid(),
-                  let argv = arguments(of: pid), staleOwner(argv: argv) != nil else { continue }
+            guard let argv = orphanArguments(pid: pid, helperPath: helperPath) else { continue }
             kill(pid, SIGTERM)
-            reaped.append(pid)
+            reaped.append((pid, argv))
         }
         if !reaped.isEmpty {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                for pid in reaped where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [reaped] in
+                // The pid may have exited and been reused within the 2 s: only the very same orphan (same executable, owner and
+                // argv) is killed.
+                for (pid, argv) in reaped where kill(pid, 0) == 0 && orphanArguments(pid: pid, helperPath: helperPath) == argv {
+                    kill(pid, SIGKILL)
+                }
             }
         }
-        return reaped
+        return reaped.map(\.pid)
+    }
+
+    /// argv of `pid` when it is one of our orphaned helpers: runs `helperPath`, belongs to this user, points at a stale directory.
+    private static func orphanArguments(pid: pid_t, helperPath: String) -> [String]? {
+        guard executablePath(of: pid) == helperPath, owner(of: pid) == getuid(),
+              let argv = arguments(of: pid), staleOwner(argv: argv) != nil else { return nil }
+        return argv
+    }
+
+    /// `proc_pidpath`, symlinks resolved.
+    private static func executablePath(of pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().path
     }
 
     private static func allPIDs() -> [pid_t] {

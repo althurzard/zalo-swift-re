@@ -321,16 +321,31 @@ final class FingerprintProxy {
 
     // MARK: Timeout helper
 
+    /// Not a task group: a group awaits every child before returning, so a body that ignores cancellation (the
+    /// HELLO continuation, a `start` in progress) held the caller past the deadline and `start()` never failed over
+    /// to URLSession. Here whichever of body / timer finishes first resumes the caller; the body is cancelled and
+    /// left to end on its own (the HELLO wait ends when `start` closes the connection and kills the helper).
     private func withTimeout<T: Sendable>(seconds: Double, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await body() }
-            group.addTask {
-                try await Task.sleep(for: .seconds(seconds))
-                throw Error.unavailable("timeout")
+        let gate = OSAllocatedUnfairLock<CheckedContinuation<T, Swift.Error>?>(initialState: nil)
+        let take: @Sendable () -> CheckedContinuation<T, Swift.Error>? = {
+            gate.withLock { pending in
+                defer { pending = nil }
+                return pending
             }
-            guard let result = try await group.next() else { throw Error.unavailable("no result") }
-            group.cancelAll()
-            return result
+        }
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Swift.Error>) in
+            gate.withLock { $0 = continuation }
+            let work = Task {
+                let result: Result<T, Swift.Error>
+                do { result = .success(try await body()) } catch { result = .failure(error) }
+                take()?.resume(with: result)
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                guard let pending = take() else { return }
+                work.cancel()
+                pending.resume(throwing: Error.unavailable("timeout"))
+            }
         }
     }
 }

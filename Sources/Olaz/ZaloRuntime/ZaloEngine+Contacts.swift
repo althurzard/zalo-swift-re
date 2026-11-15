@@ -138,9 +138,13 @@ extension ZaloEngine {
     /// Lower-cased, diacritic-folded text (Vietnamese đ/Đ included) for searching and sorting.
     nonisolated static func contactFold(_ text: String) -> String {
         text.replacingOccurrences(of: "đ", with: "d").replacingOccurrences(of: "Đ", with: "D")
-            .folding(options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: Locale(identifier: "vi"))
+            .folding(options: contactFoldOptions, locale: contactFoldLocale)
             .lowercased()
     }
+
+    /// Built once: thousands of friends are folded per contacts update.
+    nonisolated private static let contactFoldLocale = Locale(identifier: "vi")
+    nonisolated private static let contactFoldOptions: String.CompareOptions = [.diacriticInsensitive, .caseInsensitive, .widthInsensitive]
 
     private static func url(_ value: Any?) -> URL? {
         guard let text = value as? String, !text.isEmpty else { return nil }

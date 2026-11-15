@@ -112,13 +112,18 @@ struct CloudPreviewSheet: View {
 
     private func load() async {
         saved = false
-        switch await engine.cloudFetch(item.id) {
+        let result = await engine.cloudFetch(item.id)
+        // The sheet closed (or moved on to another item) during the fetch: no player for a preview nobody sees, it would
+        // never be stopped (`onDisappear` already ran).
+        guard !Task.isCancelled else { return }
+        switch result {
         case .expired: phase = .expired
         case .failed(let message): phase = .failed(message)
         case .ready(let file):
             let container = CloudContainer(fileAt: file.url)
             let output = CloudFiles.outputName(item: item, container: container)
             let staged = CloudFiles.stage(file.url, name: output.name, ext: output.ext)
+            guard !Task.isCancelled else { return }
             if (item.kind == .video || item.kind == .voice), let staged {
                 playback?.stop()
                 playback = VideoPlayback(url: staged)

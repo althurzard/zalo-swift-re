@@ -48,20 +48,35 @@ final class MediaResolver {
     }
     private final class Waiter: @unchecked Sendable { var released = false }
 
-    private var settled: [String: (resolution: MediaResolution, until: Date)] = [:]
+    /// Remembered verdicts, least recently used dropped first once `cacheLimit` is reached (O(1) per resolve).
+    private let settled: LRUCache<String, (resolution: MediaResolution, until: Date)>
     private var flights: [String: Flight] = [:]
     private var running = 0
     private var queue: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    /// Bumped by `reset()`: a flight of the previous account that answers afterwards is not remembered.
+    private var generation = 0
     let maxConcurrent: Int
 
-    init(maxConcurrent: Int = 3) { self.maxConcurrent = maxConcurrent }
+    init(maxConcurrent: Int = 3, cacheLimit: Int = 2000) {
+        self.maxConcurrent = maxConcurrent
+        settled = LRUCache(capacity: cacheLimit)
+    }
 
     /// The remembered verdict for `key`, if any.
-    func known(_ key: String) -> MediaResolution? { settled[key]?.resolution }
+    func known(_ key: String) -> MediaResolution? { settled.peek(key)?.resolution }
+
+    /// Logout: forget every verdict and stop the flights of the previous account that have not started.
+    func reset() {
+        generation += 1
+        settled.removeAll()
+        for flight in flights.values { flight.task.cancel() }
+        flights = [:]
+    }
 
     /// `force` (the retry button) ignores any remembered verdict except a final "expired": a remembered
     /// "unavailable" is retried, and a remembered file that turned out not to be loadable is looked up again.
     func resolve(key: String, force: Bool = false, run: @escaping @MainActor () async -> MediaResolution) async -> MediaResolution {
+        let generation = self.generation
         if let known = settled[key], known.until > Date() {
             switch known.resolution {
             case .unavailable where force: break
@@ -93,11 +108,11 @@ final class MediaResolver {
         leave(key, flight, waiter)
         guard let resolution = outcome else { return .unavailable }          // dropped before it started
         if flights[key] === flight { flights[key] = nil }
+        guard generation == self.generation else { return resolution }       // answered for the previous account
         switch resolution {
         case .unavailable: settled[key] = (resolution, Date().addingTimeInterval(Self.unavailableTTL))
         case .file, .expired, .unsupported: settled[key] = (resolution, .distantFuture)
         }
-        if settled.count > 2000 { settled = settled.filter { $0.value.until > Date() } }
         return resolution
     }
 
@@ -131,6 +146,90 @@ final class MediaResolver {
 
     private func release() {
         if let next = queue.popLast() { next.continuation.resume(returning: true) } else { running -= 1 }
+    }
+}
+
+/// Fixed-capacity map that drops the least recently used entry when full: dictionary + doubly linked list, O(1) per access.
+final class LRUCache<Key: Hashable, Value> {
+    private final class Node {
+        let key: Key
+        var value: Value
+        /// Towards the most recent end (weak: `next` and the dictionary own the nodes).
+        weak var prev: Node?
+        /// Towards the least recent end.
+        var next: Node?
+        init(key: Key, value: Value) { self.key = key; self.value = value }
+    }
+
+    private var nodes: [Key: Node] = [:]
+    private var head: Node?   // most recently used
+    private var tail: Node?   // least recently used
+    let capacity: Int
+
+    init(capacity: Int) { self.capacity = max(1, capacity) }
+
+    var count: Int { nodes.count }
+
+    /// Reading marks the entry as used; assigning nil removes it.
+    subscript(key: Key) -> Value? {
+        get {
+            guard let node = nodes[key] else { return nil }
+            moveToFront(node)
+            return node.value
+        }
+        set {
+            guard let newValue else { remove(key); return }
+            if let node = nodes[key] {
+                node.value = newValue
+                moveToFront(node)
+                return
+            }
+            let node = Node(key: key, value: newValue)
+            nodes[key] = node
+            insertFront(node)
+            while nodes.count > capacity, let last = tail {
+                unlink(last)
+                nodes[last.key] = nil
+            }
+        }
+    }
+
+    /// The value without touching its recency.
+    func peek(_ key: Key) -> Value? { nodes[key]?.value }
+
+    func remove(_ key: Key) {
+        guard let node = nodes.removeValue(forKey: key) else { return }
+        unlink(node)
+    }
+
+    func removeAll() {
+        // Unlinked one by one so a long chain is not released recursively.
+        var node = head
+        while let current = node { node = current.next; current.next = nil; current.prev = nil }
+        head = nil
+        tail = nil
+        nodes = [:]
+    }
+
+    private func insertFront(_ node: Node) {
+        node.prev = nil
+        node.next = head
+        head?.prev = node
+        head = node
+        if tail == nil { tail = node }
+    }
+
+    private func unlink(_ node: Node) {
+        if let prev = node.prev { prev.next = node.next } else if head === node { head = node.next }
+        if let next = node.next { next.prev = node.prev } else if tail === node { tail = node.prev }
+        node.prev = nil
+        node.next = nil
+    }
+
+    private func moveToFront(_ node: Node) {
+        guard head !== node else { return }
+        unlink(node)
+        insertFront(node)
     }
 }
 

@@ -25,6 +25,14 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
     }
     private let userAgent: String
     private var sockets: [Int: LiveSocket] = [:]
+    /// `ws.open`s still waiting for the fingerprint helper (id → open token). A `ws.close`
+    /// or `closeAllSockets()` removes the entry, which cancels the open.
+    private var pendingOpens: [Int: Int] = [:]
+    private var nextOpenToken = 0
+    /// Sockets opened from a subframe (the shim runs in every frame): their events go back there.
+    private var socketFrames: [Int: WKFrameInfo] = [:]
+    /// In-flight `http` ops by the page's request id, so `http.cancel` (fetch abort) can stop them.
+    private var httpTasks: [String: Task<Void, Never>] = [:]
     weak var webView: WKWebView?
 
     /// Optional observer for diagnostics (method, url, status).
@@ -101,9 +109,19 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         }
         switch op {
         case "http":
-            Task { replyHandler(await self.performHTTP(body), nil) }
+            let requestID = body["requestId"] as? String
+            let task = Task {
+                let result = await self.performHTTP(body)
+                if let requestID { self.httpTasks.removeValue(forKey: requestID) }
+                replyHandler(result, nil)
+            }
+            if let requestID { httpTasks[requestID] = task }
+        case "http.cancel":
+            // fetch()'s AbortSignal: cancelling the task cancels the upstream transfer.
+            if let requestID = body["requestId"] as? String { httpTasks.removeValue(forKey: requestID)?.cancel() }
+            replyHandler(nil, nil)
         case "ws.open":
-            openSocket(body)
+            openSocket(body, frame: message.frameInfo)
             replyHandler(nil, nil)
         case "ws.send":
             sendSocket(body)
@@ -183,44 +201,82 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     /// One request through the fingerprint helper. Cookies: attached from (and Set-Cookie
-    /// harvested into) the shared jar, which is what URLSession did implicitly.
+    /// harvested into) this proxy's jar, which is what URLSession did implicitly. Redirects
+    /// are followed here, hop by hop (like `MediaLoader`), so every hop's Set-Cookie is stored
+    /// and every hop's Cookie header comes from the jar for that hop's host.
     private func performViaHelper(request: URLRequest, url: URL) async throws -> [String: Any] {
-        var helperRequest = FingerprintProxy.Request(url: url)
-        helperRequest.method = request.httpMethod ?? "GET"
-        helperRequest.body = request.httpBody
-        let timeout = request.timeoutInterval
-        if timeout > 0, timeout < 600 {
-            helperRequest.timeoutMs = Int(timeout * 1000)
-        }
-        // Chromium order: the page's headers, then the browser's defaults, then cookies.
-        var headers: [(String, String)] = request.allHTTPHeaderFields?.map { ($0.key, $0.value) } ?? []
-        for name in ["User-Agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-                     "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-                     "accept-language", "accept-encoding"] where request.value(forHTTPHeaderField: name) == nil {
-            headers.append((name, Self.defaultValue(for: name)))
-        }
-        if let cookies = HTTPCookieStorage.shared.cookies(for: url), !cookies.isEmpty {
-            for (name, value) in HTTPCookie.requestHeaderFields(with: cookies) {
-                headers.append((name, value))
+        let cookieStorage = session.configuration.httpCookieStorage ?? .shared
+        var method = request.httpMethod ?? "GET"
+        var body = request.httpBody
+        var pageHeaders: [(String, String)] = request.allHTTPHeaderFields?.map { ($0.key, $0.value) } ?? []
+        var hopURL = url
+        var redirectsLeft = 20 // Chromium's limit
+        while true {
+            var helperRequest = FingerprintProxy.Request(url: hopURL)
+            helperRequest.method = method
+            helperRequest.body = body
+            helperRequest.follow = false
+            let timeout = request.timeoutInterval
+            if timeout > 0, timeout < 600 {
+                helperRequest.timeoutMs = Int(timeout * 1000)
             }
-        }
-        helperRequest.headers = headers
+            // Chromium order: the page's headers, then the browser's defaults, then cookies.
+            var headers = pageHeaders
+            for name in ["User-Agent", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                         "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+                         "accept-language", "accept-encoding"]
+            where !pageHeaders.contains(where: { $0.0.caseInsensitiveCompare(name) == .orderedSame }) {
+                headers.append((name, Self.defaultValue(for: name)))
+            }
+            if let cookies = cookieStorage.cookies(for: hopURL), !cookies.isEmpty {
+                for (name, value) in HTTPCookie.requestHeaderFields(with: cookies) {
+                    headers.append((name, value))
+                }
+            }
+            helperRequest.headers = headers
 
-        let response = try await FingerprintProxy.shared.perform(helperRequest)
-        Self.storeCookies(from: response.head.headers, url: url)
+            let response = try await FingerprintProxy.shared.perform(helperRequest)
+            Self.storeCookies(from: response.head.headers, url: hopURL, in: cookieStorage)
+            let status = response.head.status
+            guard [301, 302, 303, 307, 308].contains(status),
+                  let location = response.head.headers.first(where: { $0.0.lowercased() == "location" })?.1,
+                  let next = URL(string: location, relativeTo: hopURL)?.absoluteURL,
+                  ["http", "https"].contains(next.scheme?.lowercased() ?? "") else {
+                return helperResult(response, method: method, url: url, finalURL: hopURL)
+            }
+            guard redirectsLeft > 0 else { throw FingerprintProxy.Error.requestFailed("too many redirects", status: 0) }
+            redirectsLeft -= 1
+            try Task.checkCancellation()
+            // Fetch spec (Chromium): 303 (non-HEAD) and a POST's 301/302 continue as a bodiless GET.
+            if (status == 303 && method != "HEAD") || ((status == 301 || status == 302) && method == "POST") {
+                method = "GET"
+                body = nil
+                pageHeaders.removeAll { ["content-type", "content-length", "content-encoding",
+                                         "content-language", "content-location"].contains($0.0.lowercased()) }
+            }
+            // Sensitive headers do not leave the host they were meant for (as in MediaLoader).
+            if next.host?.lowercased() != hopURL.host?.lowercased() {
+                pageHeaders.removeAll { MediaLoader.sensitiveHeaderNames.contains($0.0.lowercased()) }
+            }
+            hopURL = next
+        }
+    }
+
+    /// The JS-facing answer for a helper response (the last hop of `performViaHelper`).
+    private func helperResult(_ response: FingerprintProxy.Response, method: String, url: URL, finalURL: URL) -> [String: Any] {
         var responseHeaders: [String: String] = [:]
         for (name, value) in response.head.headers {
             responseHeaders[name.lowercased()] = value
         }
         let status = response.head.status
-        onRequestCompleted?(helperRequest.method, url, status)
+        onRequestCompleted?(method, url, status)
         responseObserver?(url, status, response.body)
         return [
             "status": status,
             "statusText": response.head.statusText.isEmpty
                 ? HTTPURLResponse.localizedString(forStatusCode: status) : response.head.statusText,
             "headers": responseHeaders,
-            "url": response.head.url.isEmpty ? url.absoluteString : response.head.url,
+            "url": response.head.url.isEmpty ? finalURL.absoluteString : response.head.url,
             "body": response.body.base64EncodedString(),
         ]
     }
@@ -241,13 +297,13 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         }
     }
 
-    /// `Set-Cookie` lines of a helper response → the shared cookie jar (http(s) only, like
+    /// `Set-Cookie` lines of a helper response → the proxy's cookie jar (http(s) only, like
     /// URLSession did implicitly). The helper delivers each Set-Cookie as its own header.
-    private static func storeCookies(from headers: [(String, String)], url: URL) {
+    private static func storeCookies(from headers: [(String, String)], url: URL, in storage: HTTPCookieStorage) {
         guard url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http" else { return }
         for (name, value) in headers where name.lowercased() == "set-cookie" {
             if let cookie = cookie(fromSetCookie: value, url: url) {
-                HTTPCookieStorage.shared.setCookie(cookie)
+                storage.setCookie(cookie)
             }
         }
     }
@@ -382,16 +438,29 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
 
     // MARK: WebSocket
 
-    private func openSocket(_ body: [String: Any]) {
+    private func openSocket(_ body: [String: Any], frame: WKFrameInfo) {
         guard let id = (body["id"] as? NSNumber)?.intValue,
               let urlString = body["url"] as? String, let url = URL(string: urlString) else { return }
+        // Ids are random per document (network-shim.js), so a clash is a bug, not a reload.
+        guard sockets[id] == nil, pendingOpens[id] == nil else {
+            socketTrace?("ws#\(id) open ignored: id already in use")
+            return
+        }
         let params = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.map(\.name) ?? []
         socketTrace?("ws#\(id) open \(url.host() ?? "")\(url.path()) params=\(params) open-sockets=\(sockets.count)")
         let protocols = body["protocols"] as? [String] ?? []
+        if !frame.isMainFrame { socketFrames[id] = frame }
+        nextOpenToken += 1
+        let token = nextOpenToken
+        pendingOpens[id] = token
         // The fingerprint helper (Chromium's TLS on the upgrade) when it is up; a short wait
         // covers the engine-boot race where the page's first socket opens while it starts.
         Task {
-            if await FingerprintProxy.shared.ready(seconds: 3) {
+            let helperReady = await FingerprintProxy.shared.ready(seconds: 3)
+            // Closed by the page (or reset by `closeAllSockets`) during the wait: do not open.
+            guard self.pendingOpens[id] == token else { return }
+            self.pendingOpens.removeValue(forKey: id)
+            if helperReady {
                 self.openSocketViaHelper(id: id, url: url, protocols: protocols)
             } else {
                 self.openSocketViaURLSession(id: id, url: url, protocols: protocols)
@@ -432,8 +501,8 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
                 emit(id, "open", ["protocol": negotiated])
             } catch let FingerprintProxy.Error.requestFailed(message, _) {
                 // The upstream refused the upgrade: a real result, like a failed URLSession handshake.
-                sockets.removeValue(forKey: id)
                 FingerprintProxy.shared.removeWebSocketHandler(id: id)
+                guard case .helper? = sockets.removeValue(forKey: id) else { return } // closed meanwhile
                 socketTrace?("ws#\(id) helper open failed: \(message.prefix(120))")
                 emit(id, "error", [:])
                 emit(id, "close", ["code": 1006, "reason": "", "wasClean": false])
@@ -545,8 +614,16 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private func closeSocket(_ body: [String: Any]) {
-        guard let id = (body["id"] as? NSNumber)?.intValue, let socket = sockets.removeValue(forKey: id) else { return }
+        guard let id = (body["id"] as? NSNumber)?.intValue else { return }
         let code = (body["code"] as? NSNumber)?.intValue ?? 1000
+        if pendingOpens.removeValue(forKey: id) != nil {
+            // Still waiting for the helper: cancel the open (its task sees the entry gone).
+            socketTrace?("ws#\(id) closed-by-client before open code=\(code)")
+            emit(id, "close", ["code": code, "reason": body["reason"] as? String ?? "", "wasClean": true])
+            return
+        }
+        guard let socket = sockets.removeValue(forKey: id) else { return }
+        openedSockets.remove(id)
         socketTrace?("ws#\(id) closed-by-client code=\(code)")
         switch socket {
         case .helper:
@@ -560,6 +637,10 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         emit(id, "close", ["code": code, "reason": body["reason"] as? String ?? "", "wasClean": true])
     }
 
+    /// Closes every socket (1001 going away) and forgets all socket state, pending opens
+    /// included, without emitting events: the document that owned them is gone. Idempotent.
+    /// Call when the page (re)loads or its WebContent process dies; late events of the old
+    /// sockets are dropped here (unknown task / removed handler) and in the shim (unknown id).
     func closeAllSockets() {
         for (id, socket) in sockets {
             switch socket {
@@ -571,13 +652,20 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
             }
         }
         sockets.removeAll()
+        openedSockets.removeAll()
+        pendingOpens.removeAll()
+        socketFrames.removeAll()
+        frameCounts.removeAll()
     }
 
     private func emit(_ id: Int, _ type: String, _ payload: [String: Any]) {
+        // Main-frame sockets keep `nil` (the main frame); subframe sockets answer their frame.
+        let frame = socketFrames[id]
+        if type == "close" { socketFrames.removeValue(forKey: id) }
         webView?.callAsyncJavaScript(
             "window.__zaloNet && window.__zaloNet.socketEvent(id, type, payload)",
             arguments: ["id": id, "type": type, "payload": payload],
-            in: nil, in: .page, completionHandler: nil
+            in: frame, in: .page, completionHandler: nil
         )
     }
 }

@@ -18,10 +18,17 @@ enum FileSystemBridge {
             guard platform.isWritable(path) else { throw FSError(code: "EACCES", path: path) }
             return path
         }
-        func exists(_ path: String) -> Bool { fm.fileExists(atPath: path) }
+        // Reads (and the source of move/copy/link) are confined like writes, to `readableRoots` (issue #1.3).
+        // Outside them a path looks absent: exists → false, stat/access → ENOENT; content reads → EACCES.
+        func readable(_ path: String) -> Bool { isReadable(path, platform: platform) }
+        func exists(_ path: String) -> Bool { readable(path) && fm.fileExists(atPath: path) }
         func requireExists(_ path: String) throws -> String {
             guard exists(path) else { throw FSError(code: "ENOENT", path: path) }
             return path
+        }
+        func requireReadable(_ path: String) throws -> String {
+            guard readable(path) else { throw FSError(code: "EACCES", path: path) }
+            return try requireExists(path)
         }
 
         /// Node `fs.Stats`-shaped object; methods are rebuilt in JS (`local-modules.js`).
@@ -56,13 +63,13 @@ enum FileSystemBridge {
         func move(_ from: String, _ to: String) throws {
             _ = try writable(to)
             if exists(to) { try fm.removeItem(atPath: to) }
-            try fm.moveItem(atPath: try requireExists(from), toPath: to)
+            try fm.moveItem(atPath: try requireReadable(from), toPath: to)
         }
         func copy(_ from: String, _ to: String) throws {
             _ = try writable(to)
             if exists(to) { try fm.removeItem(atPath: to) }
             try fm.createDirectory(atPath: (to as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            try fm.copyItem(atPath: try requireExists(from), toPath: to)
+            try fm.copyItem(atPath: try requireReadable(from), toPath: to)
         }
         func recursive(_ options: Any?) -> Bool {
             ((options as? [String: Any])?["recursive"] as? NSNumber)?.boolValue ?? false
@@ -110,7 +117,7 @@ enum FileSystemBridge {
             return nil
         }
         both(["$znode.fs.link", "$znode.fsPromise.link"]) { args in
-            try fm.linkItem(atPath: try requireExists(args.string(0) ?? ""), toPath: try writable(args.string(1) ?? ""))
+            try fm.linkItem(atPath: try requireReadable(args.string(0) ?? ""), toPath: try writable(args.string(1) ?? ""))
             return nil
         }
         bridge.async("$znode.fs.exists") { args in exists(args.string(0) ?? "") }
@@ -125,6 +132,8 @@ enum FileSystemBridge {
         // when it is there). The media cleanup asks it before removing a cached copy that may be shared with another resource.
         bridge.async("$znode.nativelibs.fileUtilitiesAddon.detectHardlinksAsync") { args in
             let file = args.string(0) ?? "", scope = args.string(1) ?? ""
+            // Outside the readable roots: "not shared" (the official callers' answer for a missing file).
+            guard readable(file), readable(scope) else { return [String]() }
             return try await Task.detached(priority: .utility) { try FileSystemBridge.hardlinks(of: file, under: scope) }.value
         }
 
@@ -140,7 +149,7 @@ enum FileSystemBridge {
 
         // Whole-file helpers used across $zFileManager.
         bridge.async("$znode.fs.readFile") { args in
-            let path = try requireExists(args.string(0) ?? "")
+            let path = try requireReadable(args.string(0) ?? "")
             let data = fm.contents(atPath: path) ?? Data()
             let encoding = args.string(1) ?? args.dict(1)?["encoding"] as? String
             return encoding == nil ? data : String(decoding: data, as: UTF8.self)
@@ -151,6 +160,40 @@ enum FileSystemBridge {
             try (args.data(1) ?? Data()).write(to: URL(fileURLWithPath: path), options: .atomic)
             return nil
         }
+    }
+
+    /// Folders the renderer may read from (the write roots of `ZaloPlatform.isWritable` plus read-only extras):
+    /// - Zalo data (`userData`: stores, z_u.txt, logs, ZaloDownloads/resource caches, db),
+    /// - Olaz's temp folder and the whole per-user temp dir (`os.tmpdir()` reports it),
+    /// - the Downloads folder (where Zalo saves received files),
+    /// - `~/Library/Caches/Olaz` (media / file caches, download temps, staged previews written by Swift),
+    /// - the installed Zalo runtime (official code; nothing private).
+    /// Files the user picks reach the page as WebKit `File`s (`evaluate(_:providingFiles:)`), not through this bridge.
+    static func readableRoots(platform: ZaloPlatform) -> [String] {
+        let fm = FileManager.default
+        let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Olaz", isDirectory: true)
+        return [platform.userData.path, platform.path("temp"), platform.path("downloads"),
+                fm.temporaryDirectory.path, caches.path, ZaloRuntime.current.path]
+    }
+
+    /// Whether `path` (symlinks resolved, like `ZaloPlatform.isWritable`) lies inside `readableRoots`.
+    static func isReadable(_ path: String, platform: ZaloPlatform) -> Bool {
+        guard !path.isEmpty, path.hasPrefix("/") else { return false }
+        let resolved = canonical(path)
+        return readableRoots(platform: platform).map(canonical).contains { resolved == $0 || resolved.hasPrefix($0 + "/") }
+    }
+
+    /// Absolute, standardized, symlinks resolved on the longest existing ancestor (components that do not exist yet cannot be links).
+    nonisolated static func canonical(_ path: String) -> String {
+        var url = URL(fileURLWithPath: path).standardizedFileURL
+        var rest: [String] = []
+        while url.path != "/", !FileManager.default.fileExists(atPath: url.path) {
+            rest.insert(url.lastPathComponent, at: 0)
+            url = url.deletingLastPathComponent()
+        }
+        var resolved = url.resolvingSymlinksInPath()
+        for part in rest { resolved.appendPathComponent(part) }
+        return resolved.standardizedFileURL.path
     }
 
     /// Hard links of `file` under `scope` (same device and inode). A missing file, or one with a single link, has none: the official callers

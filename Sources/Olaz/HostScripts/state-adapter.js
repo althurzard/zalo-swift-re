@@ -9,6 +9,15 @@
   window.__zaloStateAdapter = true;
   const post = (state) => { try { window.webkit.messageHandlers.zstate.postMessage(state); } catch {} };
   const diag = (s) => { try { window.webkit.messageHandlers.zlog.postMessage('[adapter] ' + s); } catch {} };
+  // Errors into the host log: name + message with links and long numbers (ids, phone numbers) masked, as chat-adapter.js
+  // `scrubErr`; a non-Error rejection gives only its type / code. Stack frames keep the script's file name and position only.
+  const scrubErr = (e) => {
+    const code = e && typeof e === 'object' && (typeof e.code === 'number' || typeof e.code === 'string') ? String(e.code).slice(0, 24) + ' ' : '';
+    const text = e && typeof e === 'object' ? (e.message !== undefined || e instanceof Error ? e.name + ':' + e.message : 'object') : String(e);
+    return code + text.replace(/https?:\/\/\S+/g, '<url>').replace(/\d{5,}/g, '<id>').slice(0, 80);
+  };
+  const scrubStack = (s, n) => String(s || '').split('\n').slice(0, n)
+    .map((l) => l.replace(/https?:\/\/\S+/g, '<url>').replace(/file:\/\/\S*\/([^/\s]+)/g, '$1').slice(0, 160)).join(' < ');
   const page = location.pathname.split('/').pop();
 
   // ---- webpack access: lets Swift observe official services directly ----
@@ -60,7 +69,7 @@
         if (!proto || typeof proto.componentDidCatch !== 'function' || proto.componentDidCatch.__olaz) return;
         const original = proto.componentDidCatch;
         proto.componentDidCatch = function (error, info) {
-          diag('UI-CRASH ' + (error && error.name) + ': ' + (error && error.message) + ' | ' + String(error && error.stack || '').split('\n').slice(0, 6).join(' < ') + ' | component: ' + String(info && info.componentStack || '').split('\n').slice(0, 8).join(' < '));
+          diag('UI-CRASH ' + scrubErr(error) + ' | ' + scrubStack(error && error.stack, 6) + ' | component: ' + scrubStack(info && info.componentStack, 8));
           return original.call(this, error, info);
         };
         proto.componentDidCatch.__olaz = true;
@@ -191,7 +200,7 @@
                 } catch {}
               }
             }
-          } catch (e) { diag('preview formatter lookup failed: ' + e); }
+          } catch (e) { diag('preview formatter lookup failed: ' + scrubErr(e)); }
           if (!fn) return null;
           let lang = null;
           try {
@@ -293,7 +302,7 @@
             published = true;
           }
         };
-        convTimer = setInterval(() => { publish().catch((e) => diag('conversations publish failed: ' + e)); }, 1500);
+        convTimer = setInterval(() => { publish().catch((e) => diag('conversations publish failed: ' + scrubErr(e))); }, 1500);
         publish().catch(() => {});
       };
       if (!tryAttach()) { const t = setInterval(() => { if (tryAttach()) clearInterval(t); }, 500); }
@@ -338,10 +347,10 @@
             if (name === 'constructor' || typeof fn !== 'function' || fn.__olazTrace) continue;
             target[name] = function (...args) {
               let out;
-              try { out = fn.apply(this, args); } catch (e) { diag('trust ' + name + ' threw: ' + (e && (e.code || '') + ' ' + (e.message || e))); throw e; }
+              try { out = fn.apply(this, args); } catch (e) { diag('trust ' + name + ' threw: ' + scrubErr(e)); throw e; }
               if (out && typeof out.then === 'function') {
                 diag('trust ' + name + ' started');
-                out.then(() => diag('trust ' + name + ' ok'), (e) => diag('trust ' + name + ' FAILED: ' + (e && ((e.code || '') + ' ' + (e.message || JSON.stringify(e))))));
+                out.then(() => diag('trust ' + name + ' ok'), (e) => diag('trust ' + name + ' FAILED: ' + scrubErr(e)));
               }
               return out;
             };

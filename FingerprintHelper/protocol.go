@@ -65,7 +65,15 @@ type httpResponseSpec struct {
 }
 
 // Two pooled clients: redirects followed (normal traffic) and not (Swift re-issues those so
-// per-hop headers stay under its control, exactly like the URLSession path).
+// per-hop headers stay under its control, exactly like the URLSession path). They have no
+// overall timeout (0 lifts tls-client's whole-request deadline, which would kill any stream
+// longer than it): every request bounds itself with its own context instead —
+// performRequest for the whole exchange, performStream for the response headers, then the
+// stall watchdog for the body.
+// defaultRequestTimeout bounds a request (or a stream's wait for headers) whose spec has no
+// timeoutMs; it is the old client-wide timeout.
+const defaultRequestTimeout = 600 * time.Second
+
 var (
 	httpFollow, httpNoFollow tls_client.HttpClient
 	clientsOnce              sync.Once
@@ -75,7 +83,7 @@ var (
 func httpClients() (follow, noFollow tls_client.HttpClient, err error) {
 	clientsOnce.Do(func() {
 		options := []tls_client.HttpClientOption{
-			tls_client.WithTimeoutSeconds(600),
+			tls_client.WithTimeoutSeconds(0),
 			tls_client.WithClientProfile(profiles.Chrome_108),
 			tls_client.WithCookieJar(nil), // Olaz passes cookies explicitly and harvests Set-Cookie itself
 		}
@@ -88,39 +96,100 @@ func httpClients() (follow, noFollow tls_client.HttpClient, err error) {
 	return httpFollow, httpNoFollow, clientsErr
 }
 
-// Cancellation for in-flight requests and websocket sessions, by id.
-var (
-	cancelsMu sync.Mutex
-	cancels   = map[string]context.CancelFunc{}
-)
+// conn is one Olaz↔helper connection: commands are read sequentially, replies are written
+// from many goroutines under a lock. In-flight requests and websocket sessions belong to the
+// connection that started them, so ids from another (or a later) connection never collide and
+// everything still running is torn down when Olaz goes away.
+type conn struct {
+	net.Conn
+	writeMu sync.Mutex
 
-func registerCancel(id string) context.Context {
-	cancelsMu.Lock()
-	defer cancelsMu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancels[id] = cancel
-	return ctx
+	ctx context.Context // cancelled when the connection ends
+
+	mu        sync.Mutex
+	inflight  map[string]*inflightEntry // REQ / WSOPEN ids, registered before their goroutine starts
+	early     map[string]time.Time      // CANCEL / WSCLOSE for an id not registered yet
+	finished  map[string]time.Time      // ids released recently: a late CANCEL for them is not "early"
+	lastPrune time.Time
+	ws        map[string]*wsSession
 }
 
-func cancelRequest(id string) {
-	cancelsMu.Lock()
-	defer cancelsMu.Unlock()
-	if cancel, ok := cancels[id]; ok {
+type inflightEntry struct {
+	cancel context.CancelFunc
+}
+
+// earlyCancelTTL is how long a CANCEL that names an unknown id is remembered (Swift may send
+// CANCEL before REQ when its task is already cancelled), and how long a released id is
+// remembered so a CANCEL arriving just after completion is not mistaken for an early one.
+const earlyCancelTTL = 10 * time.Second
+
+func newConn(nc net.Conn, ctx context.Context) *conn {
+	return &conn{
+		Conn: nc, ctx: ctx,
+		inflight: map[string]*inflightEntry{},
+		early:    map[string]time.Time{},
+		finished: map[string]time.Time{},
+		ws:       map[string]*wsSession{},
+	}
+}
+
+// register makes id cancellable. It runs on the command loop, before the goroutine that serves
+// the id starts, so a CANCEL that follows the command always finds it; a CANCEL that came
+// before it (remembered in early) cancels it right away. release must be called when done.
+func (c *conn) register(id string) (ctx context.Context, release func()) {
+	ctx, cancel := context.WithCancel(c.ctx)
+	entry := &inflightEntry{cancel: cancel}
+	c.mu.Lock()
+	c.pruneLocked()
+	delete(c.finished, id)
+	if _, ok := c.early[id]; ok {
+		delete(c.early, id)
+		cancel()
+	}
+	c.inflight[id] = entry
+	c.mu.Unlock()
+	return ctx, func() {
+		c.mu.Lock()
+		if c.inflight[id] == entry {
+			delete(c.inflight, id)
+			c.finished[id] = time.Now()
+		}
+		c.mu.Unlock()
 		cancel()
 	}
 }
 
-func releaseCancel(id string) {
-	cancelsMu.Lock()
-	defer cancelsMu.Unlock()
-	delete(cancels, id)
+// cancel cancels id if it is in flight; an id that is neither in flight nor recently finished
+// is remembered briefly, in case its REQ / WSOPEN is still behind this command.
+func (c *conn) cancel(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneLocked()
+	if entry, ok := c.inflight[id]; ok {
+		entry.cancel()
+		return
+	}
+	if _, ok := c.finished[id]; !ok {
+		c.early[id] = time.Now()
+	}
 }
 
-// conn is one Olaz↔helper connection: commands are read sequentially, replies are written
-// from many goroutines under a lock.
-type conn struct {
-	net.Conn
-	writeMu sync.Mutex
+func (c *conn) pruneLocked() {
+	now := time.Now()
+	if now.Sub(c.lastPrune) < time.Second {
+		return
+	}
+	c.lastPrune = now
+	for id, at := range c.early {
+		if now.Sub(at) > earlyCancelTTL {
+			delete(c.early, id)
+		}
+	}
+	for id, at := range c.finished {
+		if now.Sub(at) > earlyCancelTTL {
+			delete(c.finished, id)
+		}
+	}
 }
 
 func (c *conn) writeLine(line string) error {
@@ -148,9 +217,14 @@ func (c *conn) writeJSONLine(prefix string, value any) error {
 	return c.writeLine(prefix + string(encoded) + "\n")
 }
 
+// maxWSSendBytes caps one WSSEND payload; a larger one is read and dropped (framing intact).
+const maxWSSendBytes = 64 << 20
+
 func handleConn(nc net.Conn) {
+	ctx, cancelAll := context.WithCancel(context.Background())
 	defer nc.Close()
-	c := &conn{Conn: nc}
+	defer cancelAll() // aborts every request and closes every websocket of this connection
+	c := newConn(nc, ctx)
 
 	reader := bufio.NewReaderSize(nc, 64<<10)
 	for {
@@ -176,35 +250,47 @@ func handleConn(nc net.Conn) {
 					file.Close()
 				}
 			}
+			requestCtx, release := c.register(id)
 			go func(id, jsonSpec string) {
-				defer releaseCancel(id)
+				defer release()
 				spec := httpRequestSpec{}
 				if err := json.Unmarshal([]byte(jsonSpec), &spec); err != nil {
 					_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "bad request json: " + err.Error()})
 					return
 				}
 				if spec.Stream {
-					performStream(c, id, spec)
+					performStream(requestCtx, c, id, spec)
 				} else {
-					performRequest(c, id, spec)
+					performRequest(requestCtx, c, id, spec)
 				}
 			}(id, rest)
 		case "CANCEL":
 			if id != "" {
-				cancelRequest(id)
+				c.cancel(id)
 			}
 		case "WSOPEN":
 			if id != "" {
-				go openWebSocket(c, id, rest)
+				dialCtx, release := c.register(id)
+				go openWebSocket(dialCtx, release, c, id, rest)
 			}
 		case "WSSEND":
-			// rest = "text|binary <len>"
+			// rest = "text|binary <len>". The payload must be consumed whatever else is wrong
+			// with the frame; a length that cannot be read leaves no way to find the next frame.
 			parts := strings.SplitN(rest, " ", 2)
-			if id == "" || len(parts) != 2 {
-				continue
+			if len(parts) != 2 {
+				log.Printf("wssend: malformed frame %q; closing connection", line)
+				return
 			}
-			length, err := strconv.Atoi(parts[1])
+			length, err := strconv.ParseInt(parts[1], 10, 64)
 			if err != nil || length < 0 {
+				log.Printf("wssend: bad length %q; closing connection", parts[1])
+				return
+			}
+			if id == "" || length > maxWSSendBytes {
+				if _, err := io.CopyN(io.Discard, reader, length); err != nil {
+					log.Printf("wssend skip: %v", err)
+					return
+				}
 				continue
 			}
 			payload := make([]byte, length)
@@ -212,14 +298,14 @@ func handleConn(nc net.Conn) {
 				log.Printf("wssend read: %v", err)
 				return
 			}
-			sendWebSocket(id, parts[0], payload)
+			sendWebSocket(c, id, parts[0], payload)
 		case "WSCLOSE":
 			code := 1000
 			if value, err := strconv.Atoi(rest); err == nil {
 				code = value
 			}
 			if id != "" {
-				closeWebSocket(id, code)
+				closeWebSocket(c, id, code)
 			}
 		case "SHUTDOWN":
 			_ = c.writeLine("BYE\n")
@@ -273,14 +359,13 @@ func newUpstreamRequest(ctx context.Context, spec httpRequestSpec) (*http.Reques
 }
 
 // non-streaming: the whole body in one RES frame (base64, capped).
-func performRequest(c *conn, id string, spec httpRequestSpec) {
-	ctx := registerCancel(id)
-	defer releaseCancel(id)
+func performRequest(ctx context.Context, c *conn, id string, spec httpRequestSpec) {
+	timeout := defaultRequestTimeout
 	if spec.TimeoutMs > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(spec.TimeoutMs)*time.Millisecond)
-		defer cancel()
+		timeout = time.Duration(spec.TimeoutMs) * time.Millisecond
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	follow, noFollow, err := httpClients()
 	if err != nil {
@@ -334,9 +419,12 @@ func performRequest(c *conn, id string, spec httpRequestSpec) {
 
 // streaming: RESHEAD, then CHUNK frames until END (or ERR). Redirects are answered as a
 // complete RES so Swift can re-issue them with its own per-hop headers.
-func performStream(c *conn, id string, spec httpRequestSpec) {
-	ctx := registerCancel(id)
-	defer releaseCancel(id)
+//
+// Timeouts: timeoutMs (default defaultRequestTimeout) bounds only the wait for the response
+// headers; the body has no overall deadline, only the stall watchdog (idleMs between reads,
+// firstByteMs until the first body byte). END is sent only for a body read to EOF — a
+// cancelled, stalled or failed stream ends with ERR so a truncated body is never complete.
+func performStream(ctx context.Context, c *conn, id string, spec httpRequestSpec) {
 	ctx, requestCancel := context.WithCancel(ctx)
 	defer requestCancel()
 
@@ -360,12 +448,27 @@ func performStream(c *conn, id string, spec httpRequestSpec) {
 			file.Close()
 		}
 	}
+	headerTimeout := defaultRequestTimeout
+	if spec.TimeoutMs > 0 {
+		headerTimeout = time.Duration(spec.TimeoutMs) * time.Millisecond
+	}
+	// A timer rather than context.WithTimeout: the same context must stay alive for the body.
+	headerTimer := time.AfterFunc(headerTimeout, requestCancel)
 	response, err := client.Do(request)
+	headersInTime := headerTimer.Stop()
 	if err != nil {
-		_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "request: " + cleanError(err)})
+		message := "request: " + cleanError(err)
+		if !headersInTime {
+			message = "request: timed out waiting for response headers"
+		}
+		_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: message})
 		return
 	}
 	defer response.Body.Close()
+	if !headersInTime {
+		_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "request: timed out waiting for response headers"})
+		return
+	}
 
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
@@ -397,9 +500,10 @@ func performStream(c *conn, id string, spec httpRequestSpec) {
 	var total int64
 	buffer := make([]byte, 64<<10)
 	for {
-		watchdog.activity()
+		watchdog.reading()
 		n, readErr := response.Body.Read(buffer)
 		if n > 0 {
+			watchdog.received()
 			total += int64(n)
 			if spec.MaxBytes > 0 && total > spec.MaxBytes {
 				_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "body too large"})
@@ -410,10 +514,13 @@ func performStream(c *conn, id string, spec httpRequestSpec) {
 			}
 		}
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) || errors.Is(readErr, context.Canceled) {
+			switch {
+			case errors.Is(readErr, io.EOF):
 				_ = c.writeLine("END " + id + "\n")
-			} else {
-				_ = c.writeJSONLine("ERR "+id+" ", map[string]string{"error": "body: " + cleanError(readErr)})
+			case watchdog.fired():
+				_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "body: stalled, no data within " + watchdog.window().String()})
+			default:
+				_ = c.writeJSONLine("ERR "+id+" ", httpResponseSpec{Error: "body: " + cleanError(readErr)})
 			}
 			return
 		}
@@ -443,13 +550,17 @@ func cleanError(err error) string {
 }
 
 // stallWatchdog cancels the request when nothing arrives within the idle window (a shorter
-// window applies until the first byte, when FirstByteMs is set).
+// window applies until the first body byte, when FirstByteMs is set). Before the first byte
+// the window runs from RESHEAD; after it, from the start of the current read, so time spent
+// handing a chunk to Olaz never counts as an upstream stall.
 type stallWatchdog struct {
 	cancel    context.CancelFunc
 	stopCh    chan struct{}
+	stopOnce  sync.Once
 	mu        sync.Mutex
 	last      time.Time
 	firstSeen bool
+	expired   bool
 	idle      time.Duration
 	firstByte time.Duration
 }
@@ -463,6 +574,13 @@ func newStallWatchdog(cancel context.CancelFunc, idle, firstByte time.Duration) 
 	return w
 }
 
+func (w *stallWatchdog) windowLocked() time.Duration {
+	if !w.firstSeen && w.firstByte > 0 {
+		return w.firstByte
+	}
+	return w.idle
+}
+
 func (w *stallWatchdog) loop() {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -472,11 +590,10 @@ func (w *stallWatchdog) loop() {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			window := w.idle
-			if !w.firstSeen && w.firstByte > 0 {
-				window = w.firstByte
+			expired := time.Since(w.last) > w.windowLocked()
+			if expired {
+				w.expired = true
 			}
-			expired := time.Since(w.last) > window
 			w.mu.Unlock()
 			if expired {
 				w.cancel()
@@ -486,17 +603,36 @@ func (w *stallWatchdog) loop() {
 	}
 }
 
-func (w *stallWatchdog) activity() {
+// reading is called before each body read.
+func (w *stallWatchdog) reading() {
+	w.mu.Lock()
+	if w.firstSeen {
+		w.last = time.Now()
+	}
+	w.mu.Unlock()
+}
+
+// received is called when a read returned bytes.
+func (w *stallWatchdog) received() {
 	w.mu.Lock()
 	w.last = time.Now()
 	w.firstSeen = true
 	w.mu.Unlock()
 }
 
+// fired reports whether the watchdog cancelled the request.
+func (w *stallWatchdog) fired() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.expired
+}
+
+func (w *stallWatchdog) window() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.windowLocked()
+}
+
 func (w *stallWatchdog) stop() {
-	select {
-	case <-w.stopCh:
-	default:
-		close(w.stopCh)
-	}
+	w.stopOnce.Do(func() { close(w.stopCh) })
 }

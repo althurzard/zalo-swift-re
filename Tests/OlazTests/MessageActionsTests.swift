@@ -94,7 +94,7 @@ import Foundation
           o: function (m) { return m.status === -2; }, r: function (m) { return m.msgType === 2503; }, s: function (m) { return m.msgType === 2502; },
           F: function (m) { return m.msgType === 2502 && m.message.length === 1; }, l: function () { return false; }, I: function () { return false; }, R: function () { return false; }
         };
-        var cfg = { recallMessageMaxTime: 86400000, undo_delete: { enable: 1, timeout: 5600 }, enable_popup_confim_del: \(popupDel), forward_conv_limit: 3,
+        var cfg = { sendToMeId: 'cloud1', stickerUrl: '', recallMessageMaxTime: 86400000, undo_delete: { enable: 1, timeout: 5600 }, enable_popup_confim_del: \(popupDel), forward_conv_limit: 3,
           settings: { group: { topic_colors: [-14540254] } }, group_topics: { enable: 1, enable_pin_limit: 1, pin_limit: 2 } };
         var types = { cloud1: 1, g9: 2 };
         var groups = { g9: { userId: 'g9', creatorId: 'u5', setting: { setTopicOnly: \(setTopicOnly) }, topMember: [{ id: 'u5' }, { id: 'u6', isAdmin: true }] } };

@@ -38,6 +38,8 @@ final class SQLiteHost: @unchecked Sendable {
         let db: OpaquePointer
         let queue: DispatchQueue
         var sessional: Bool
+        /// Set (on `queue`) right before `sqlite3_close_v2`: work queued behind a `close` must not touch the freed `db`.
+        var closed = false
         init(db: OpaquePointer, name: String, sessional: Bool) {
             self.db = db
             self.sessional = sessional
@@ -48,10 +50,17 @@ final class SQLiteHost: @unchecked Sendable {
     /// JSON payloads (`[Any]`, rows) crossing the database queue; the values are never shared.
     struct Unchecked<T>: @unchecked Sendable { let value: T }
 
-    /// Schema-version handshake in flight for a database: later openers wait for it.
-    private final class Migration {
-        var waiters: [CheckedContinuation<Void, Never>] = []
+    /// Schema-version handshake in flight for a database: later openers wait for it. Guarded by `lock`.
+    private final class Migration: @unchecked Sendable {
+        var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     }
+
+    /// How long an opener waits for another page's migration before treating it as abandoned (that page died
+    /// mid-migration without `closeAll`).
+    private static let migrationTimeout: TimeInterval = 60
+
+    /// node-sqlite3's error for a statement on a closed database.
+    static let closedError = SQLiteError(errno: SQLITE_MISUSE, code: "SQLITE_MISUSE", detail: "Database is closed")
 
     let root: URL
     private let lock = NSLock()
@@ -86,37 +95,74 @@ final class SQLiteHost: @unchecked Sendable {
     /// during that time waits and gets `migrate: false`.
     func open(_ fullname: String, requestedVersion: Int?, sessional: Bool) async throws -> (userVersion: Int, migrate: Bool) {
         let name = sanitized(fullname)
-        let connection = try connect(name, sessional: sessional)
         while true {
-            let pending: Migration? = lock.withLock { migrations[name] }
-            guard let pending else { break }
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                lock.withLock { pending.waiters.append(continuation) }
+            if let pending = lock.withLock({ migrations[name] }) {
+                await waitForMigration(pending, name: name)
+                continue
+            }
+            // Connect after any wait: a `close` that released the wait also closed the previous connection.
+            let connection = try connect(name, sessional: sessional)
+            let current = try await onQueue(connection) { c in try Self.userVersion(c.db) }
+            var requested = requestedVersion ?? current
+            requested = max(requested, 1)
+            guard current != requested else { return (current, false) }
+            // Re-check under the lock: another opener may have claimed the migration during the `await` above.
+            let claimed: Bool = lock.withLock {
+                guard migrations[name] == nil else { return false }
+                migrations[name] = Migration()
+                return true
+            }
+            if claimed { return (current, true) }
+        }
+    }
+
+    /// Suspends until `pending` ends (`migrated` / `close` / `closeAll`) or `migrationTimeout` elapses; returns at once
+    /// when `pending` already ended. On timeout the migration is dropped as abandoned, so `open`'s loop re-reads the
+    /// version and one opener may claim it.
+    private func waitForMigration(_ pending: Migration, name: String) async {
+        let id = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let registered: Bool = lock.withLock {
+                guard migrations[name] === pending else { return false }
+                pending.waiters[id] = continuation
+                return true
+            }
+            guard registered else { continuation.resume(); return }
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.migrationTimeout) { [self] in
+                let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+                    guard pending.waiters[id] != nil else { return [] } // already released
+                    if migrations[name] === pending { migrations.removeValue(forKey: name) }
+                    defer { pending.waiters.removeAll() }
+                    return Array(pending.waiters.values)
+                }
+                waiters.forEach { $0.resume() }
             }
         }
-        let current = try await onQueue(connection) { c in try Self.userVersion(c.db) }
-        var requested = requestedVersion ?? current
-        requested = max(requested, 1)
-        guard current != requested else { return (current, false) }
-        lock.withLock { migrations[name] = Migration() }
-        return (current, true)
+    }
+
+    /// Removes `name`'s migration (if any) and returns its waiters, to resume outside the lock. Call with `lock` held.
+    private func endMigrationLocked(_ name: String) -> [CheckedContinuation<Void, Never>] {
+        guard let pending = migrations.removeValue(forKey: name) else { return [] }
+        defer { pending.waiters.removeAll() }
+        return Array(pending.waiters.values)
     }
 
     /// The renderer finished (or failed) the schema migration started by `open`.
     func migrated(_ fullname: String) {
         let name = sanitized(fullname)
-        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
-            let pending = migrations.removeValue(forKey: name)
-            return pending?.waiters ?? []
-        }
+        let waiters = lock.withLock { endMigrationLocked(name) }
         waiters.forEach { $0.resume() }
     }
 
     func close(_ fullname: String) async {
         let name = sanitized(fullname)
-        guard let connection = lock.withLock({ connections.removeValue(forKey: name) }) else { return }
+        // A migration cannot outlive its database: release anyone waiting for it.
+        let (connection, waiters) = lock.withLock { (connections.removeValue(forKey: name), endMigrationLocked(name)) }
+        waiters.forEach { $0.resume() }
+        guard let connection else { return }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             connection.queue.async {
+                connection.closed = true
                 sqlite3_close_v2(connection.db)
                 continuation.resume()
             }
@@ -124,6 +170,11 @@ final class SQLiteHost: @unchecked Sendable {
     }
 
     func closeAll() async {
+        // Also drop migrations whose page died mid-handshake (otherwise every later `open` waits on them).
+        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+            Array(migrations.keys).flatMap { endMigrationLocked($0) }
+        }
+        waiters.forEach { $0.resume() }
         for name in lock.withLock({ Array(connections.keys) }) { await close(name) }
     }
 
@@ -303,6 +354,8 @@ final class SQLiteHost: @unchecked Sendable {
     private func onQueue<T: Sendable>(_ connection: Connection, _ body: @escaping @Sendable (Connection) throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
             connection.queue.async {
+                // Queued before a `close` that already ran: `db` is freed (node-sqlite3 answers SQLITE_MISUSE).
+                guard !connection.closed else { continuation.resume(throwing: Self.closedError); return }
                 do { continuation.resume(returning: try body(connection)) } catch { continuation.resume(throwing: error) }
             }
         }

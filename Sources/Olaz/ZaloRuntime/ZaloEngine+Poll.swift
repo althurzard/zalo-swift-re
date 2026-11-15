@@ -496,22 +496,39 @@ extension ZaloEngine {
     /// WRITE (user pressed "Xác nhận"): official `votePoll` — vote / change vote / unvote, plus options added by me.
     func votePoll(_ id: String, in conversationId: String, draft: PollVoteDraft, detail: PollDetail) async -> PollActionResult {
         let request = draft.request(for: detail)
-        return actionResult(await awaitPoll("vote", conversationId, id, request.newOptions, request.votedIds))
+        return await pollWrite("vote", [conversationId, id, request.newOptions, request.votedIds])
     }
 
     /// WRITE (user confirmed "Khóa bình chọn"): official `lockPoll`.
     func lockPoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        actionResult(await awaitPoll("lock", conversationId, id))
+        await pollWrite("lock", [conversationId, id])
     }
 
     /// WRITE (user chose "Gửi vào nhóm"): official `sharePollInGroup` — posts the poll again into the group.
     func sharePoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        actionResult(await awaitPoll("share", conversationId, id))
+        await pollWrite("share", [conversationId, id])
     }
 
     /// WRITE (user pressed "Tạo bình chọn"): official `createPoll`.
     func createPoll(in conversationId: String, draft: PollCreateDraft, config: PollConfig, canPin: Bool) async -> PollActionResult {
-        actionResult(await awaitPoll("create", conversationId, draft.spec(config: config, canPin: canPin)))
+        await pollWrite("create", [conversationId, draft.spec(config: config, canPin: canPin)])
+    }
+
+    /// Swift-side cap on one poll write (the page's own requests answer well before).
+    static let pollWriteTimeout: Double = 90
+
+    /// A poll WRITE with a bounded wait. No answer — the cap passed, or the call threw because the page reloaded — means
+    /// the write may still have happened: "unknown" (pending: "kiểm tra lại"), never a failure that invites a retry into a
+    /// duplicate vote / poll / share. A missing adapter (nothing was started) stays a plain failure.
+    private func pollWrite(_ method: String, _ args: [Any]) async -> PollActionResult {
+        guard host != nil, let json = Self.pollArguments(args) else { return PollActionResult(ok: false, error: "unavailable") }
+        let script = "const c = window.__zaloPoll; if (!c || !c.\(method)) return 'missing'; return await c.\(method)(...\(json));"
+        let answer = await raceTimeout(Self.pollWriteTimeout) { [self] in JSBox(value: await host?.evaluate(script)) }
+        guard let value = answer?.value else {
+            EngineLog.shared.write("poll \(method) → no answer (pending)")
+            return PollActionResult(ok: false, error: "unknown")
+        }
+        return actionResult(value)
     }
 
     private func actionResult(_ value: Any?) -> PollActionResult {
@@ -565,13 +582,6 @@ extension ZaloEngine {
             let result = await self?.host?.evaluate(script)
             if (result as? String) != "ok" { EngineLog.shared.write("poll \(method) → \(result ?? "nil")") }
         }
-    }
-
-    /// `await window.__zaloPoll[method](...args)`.
-    private func awaitPoll(_ method: String, _ args: Any...) async -> Any? {
-        guard let json = Self.pollArguments(args) else { return nil }
-        let script = "const c = window.__zaloPoll; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        return await host?.evaluate(script)
     }
 
     /// `awaitPoll` that gives up after `seconds` (the page keeps working; its late answer is dropped). nil = no answer.

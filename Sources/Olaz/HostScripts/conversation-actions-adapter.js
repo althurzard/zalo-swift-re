@@ -85,8 +85,9 @@
     const req = window.__zaloRequire;
     if (!req || typeof window.__zaloDI !== 'function' || typeof window.__zaloEachExport !== 'function') return ready();
     if (ready() && X.groups && X.mark && X.react && X.delMgr && X.bus && X.actions) return true;
-    // Optional services that never match must not keep a full module scan running every second; the hidden-chat manager never backs off.
-    if (Date.now() - lastResolve < (scans > 60 && X.hidden ? 30000 : 1000)) return ready();
+    // Services that never match must not keep a full DI / module scan running every second: 1 s for the first 60 scans, then 5 s while
+    // the hidden-chat manager (which gates the whole snapshot) is still missing, then 30 s. An explicit action rescans at once (`need`).
+    if (Date.now() - lastResolve < (scans <= 60 ? 1000 : !X.hidden && scans <= 120 ? 5000 : 30000)) return ready();
     lastResolve = Date.now(); scans++;
     safe(() => { for (const reg of window.__zaloDI(req)) {
       const i = reg && reg.instance;
@@ -201,7 +202,7 @@
   // The hidden-chat state is only trustworthy once the manager's store exists (it needs the user id: before that `getUidsHiddenChat()` is null and
   // `getPIN()` ""), the remote config is decided (`enable_hidden_chat` -1 = not yet) and, when the feature is on, the list has been loaded from the
   // server (`_handleSucess` ran) or an earlier session saved the config (`init()` then skips the fetch and the persisted ids are authoritative).
-  let hiddenFetched = false, hiddenFetchAsked = false, patchedHidden = false;
+  let hiddenFetched = false, hiddenFetchTries = 0, hiddenFetchNext = 0, patchedHidden = false;
   const hiddenStored = () => {
     try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.endsWith('data_config_hidden_chat')) return true; } } catch {}
     return false;
@@ -218,8 +219,15 @@
     if (raw === undefined || raw === -1) return false;                                   // config not received
     if (!raw) return true;                                                               // feature off
     if (hiddenFetched || hiddenStored()) return true;
-    // Feature on but the list was never fetched on this Mac: ask for it once (official `forceGetListHiddenChat`, a read).
-    if (!hiddenFetchAsked && typeof X.hidden.forceGetListHiddenChat === 'function') { hiddenFetchAsked = true; safe(() => X.hidden.forceGetListHiddenChat(), null); }
+    // Feature on but the list was never fetched on this Mac: ask for it (official `forceGetListHiddenChat`, a read). A fetch that failed
+    // (no `_handleSucess` yet) is asked again with backoff: 10 s, 20 s, 40 s … capped at 5 min.
+    if (Date.now() >= hiddenFetchNext && typeof X.hidden.forceGetListHiddenChat === 'function') {
+      hiddenFetchTries++;
+      hiddenFetchNext = Date.now() + Math.min(300000, 10000 * 2 ** Math.min(hiddenFetchTries - 1, 5));
+      if (hiddenFetchTries > 1) diag('hidden list fetch retry ' + hiddenFetchTries);
+      Promise.resolve(safe(() => X.hidden.forceGetListHiddenChat(), null))
+        .catch((e) => diag('hidden list fetch failed: ' + (e && e.message ? 'error' : typeof e)));
+    }
     return false;
   };
   const snapshot = () => {
@@ -241,7 +249,7 @@
     let snap;
     try { snap = ready() ? snapshot() : { epoch: EPOCH, hidden: hiddenSnapshot() }; }
     catch (e) {
-      diag('snapshot failed: ' + e);
+      diag('snapshot failed: ' + (e && e.name ? e.name : typeof e));
       // A broken full snapshot must not leave the app waiting on the hidden state.
       try { snap = { epoch: EPOCH, hidden: hiddenSnapshot() }; } catch { return; }
     }
@@ -313,7 +321,7 @@
   };
   const fail = (text) => ({ ok: false, text: text || TEXT.generic });
   const notReady = () => fail(TEXT.notReady);
-  const need = (...keys) => { resolve(); return keys.every((k) => X[k]); };
+  const need = (...keys) => { if (!keys.every((k) => X[k])) lastResolve = 0; resolve(); return keys.every((k) => X[k]); };
   const str = (v) => String(v == null ? '' : v);
   // The services reject with the localized message string; "" = nothing to say (official `""!==e&&createError(e)`), anything else the generic text.
   const errString = (e, d) => (e === '' ? '' : typeof e === 'string' && e.trim() ? e : d);

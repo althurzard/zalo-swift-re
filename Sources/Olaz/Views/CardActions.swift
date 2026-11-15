@@ -285,6 +285,17 @@ extension String {
         }
         return out
     }
+
+    /// `prefixUTF16`, except while the focused field is composing (IME marked text): cutting a half-typed Telex syllable
+    /// garbles it. The limit is applied again on the next edit, and the submit paths clamp what they send.
+    @MainActor func limitedUTF16(_ limit: Int) -> String {
+        TextComposition.isActive ? self : prefixUTF16(limit)
+    }
+}
+
+/// Whether the focused text field (its field editor, or a `TextEditor`'s text view) holds IME marked text.
+@MainActor enum TextComposition {
+    static var isActive: Bool { (NSApp.keyWindow?.firstResponder as? NSTextView)?.hasMarkedText() == true }
 }
 
 // MARK: - Buttons

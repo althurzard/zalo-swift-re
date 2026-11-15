@@ -151,6 +151,8 @@ extension ZaloEngine {
         case .callState(let state):
             next.nativeState = state
             if state == "free" { next.incoming = nil }
+            // Answered (or another call took over): the "đang gọi cho bạn" banner is stale. The in-app banner stays until "free".
+            if state == "incall", let incoming = call.incoming { withdrawIncomingCallBanner(incoming.id) }
         case .popup(let header, let content):
             if !content.isEmpty || !header.isEmpty {
                 next.notice = CallState.Notice(title: header.isEmpty ? "Cuộc gọi Zalo" : header, message: content)
@@ -248,12 +250,24 @@ extension ZaloEngine {
         content.title = "Cuộc gọi đến"
         content.body = "\(incoming.name) đang gọi cho bạn"
         content.threadIdentifier = "zalo-call"
-        Task {
+        Task { [weak self] in
             let center = UNUserNotificationCenter.current()
             let status = await center.notificationSettings().authorizationStatus
             guard status == .authorized || status == .provisional else { return }
-            try? await center.add(UNNotificationRequest(identifier: "call-" + incoming.id.uuidString, content: content, trigger: nil))
+            // Ended / answered / missed while authorization was read: nothing to announce.
+            guard self?.call.incoming?.id == incoming.id else { return }
+            try? await center.add(UNNotificationRequest(identifier: Self.incomingCallBannerId(incoming.id), content: content, trigger: nil))
+            // Ended while the banner was being added: take it back.
+            if self?.call.incoming?.id != incoming.id { self?.withdrawIncomingCallBanner(incoming.id) }
         }
+    }
+
+    static func incomingCallBannerId(_ id: UUID) -> String { NativeNotifier.callPrefix + id.uuidString }
+
+    /// The call ended, was missed, answered or replaced: its macOS banner leaves Notification Center
+    /// (called from `call`'s `didSet` whenever `incoming` stops being this call).
+    func withdrawIncomingCallBanner(_ id: UUID) {
+        NativeNotifier.shared.removeNotifications(withIdentifiers: [Self.incomingCallBannerId(id)])
     }
 
     private func scheduleIncomingExpiry(_ id: UUID) {

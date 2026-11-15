@@ -12,6 +12,11 @@
   const bridge = (msg) => window.webkit.messageHandlers.znet.postMessage(msg);
   const isRemote = (url) => /^(https?|wss?):/i.test(String(url));
   const absolute = (url) => new URL(String(url), location.href).href;
+  // Swift's NetworkProxy outlives documents and serves every frame: request ids carry a
+  // per-document token, socket ids start at a random 31-bit offset (Swift/helper use Int ids).
+  const docToken = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  let nextRequest = 0;
+  const newRequestId = () => docToken + '.' + (++nextRequest);
 
   const toBase64 = (bytes) => {
     let s = '';
@@ -127,9 +132,27 @@
     const headers = {};
     new Headers((req && req.headers) || undefined).forEach((v, k) => { headers[k] = v; });
     new Headers(init.headers || undefined).forEach((v, k) => { headers[k] = v; });
+    const signal = init.signal || (req && req.signal) || null;
+    const abortError = () => (signal.reason !== undefined ? signal.reason : new DOMException('The user aborted a request.', 'AbortError'));
+    if (signal && signal.aborted) throw abortError();
     let body = init.body;
     if (body === undefined && req && method !== 'GET' && method !== 'HEAD') body = await req.arrayBuffer();
-    const res = await bridge({ op: 'http', method, url, headers, body: await encodeBody(body), timeout: 0 });
+    const encoded = await encodeBody(body);
+    if (signal && signal.aborted) throw abortError();
+    const requestId = newRequestId();
+    const pending = bridge({ op: 'http', method, url, headers, body: encoded, timeout: 0, requestId });
+    let res;
+    if (signal) {
+      let onAbort;
+      const aborted = new Promise((_, reject) => {
+        onAbort = () => { bridge({ op: 'http.cancel', requestId }).catch(() => {}); reject(abortError()); };
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      pending.catch(() => {}); // the race's loser must not surface as an unhandled rejection
+      try { res = await Promise.race([pending, aborted]); } finally { signal.removeEventListener('abort', onAbort); }
+    } else {
+      res = await pending;
+    }
     if (!res || res.error) throw new TypeError('Failed to fetch' + (res && res.error ? ': ' + res.error : ''));
     const out = new Response([204, 205, 304].includes(res.status) ? null : fromBase64(res.body), { status: res.status, statusText: res.statusText || '', headers: res.headers || {} });
     Object.defineProperty(out, 'url', { value: res.url || url });
@@ -138,7 +161,7 @@
 
   // ---------------------------------------------------------------- WebSocket
   const sockets = new Map();
-  let nextSocket = 1;
+  let nextSocket = 1 + Math.floor(Math.random() * 0x7fffffff); // unique across reloads and frames
   class ProxiedWebSocket extends EventTarget {
     constructor(url, protocols) {
       super();

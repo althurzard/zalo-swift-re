@@ -185,8 +185,17 @@ extension ZaloEngine {
 
     private func copyAllowed(in conversationId: String) async -> Bool {
         let answer = await raceTimeout(5) { [self] in JSBox(value: await evaluateActions("isProtected", [conversationId])) }
-        guard (answer?.value as? Bool) == true else { return true }
-        CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: conversationId)
+        // Fails closed: only an explicit "not protected" answer allows the copy (a timeout, reload or unknown shape must not
+        // bypass "Chặn chia sẻ").
+        switch answer?.value as? Bool {
+        case false?:
+            return true
+        case true?:
+            CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: conversationId)
+        case nil:
+            EngineLog.shared.write("message isProtected → no answer, copy refused")
+            CardActionCenter.shared.show("Chưa kiểm tra được quyền sao chép. Hãy thử lại sau.", in: conversationId)
+        }
         return false
     }
 

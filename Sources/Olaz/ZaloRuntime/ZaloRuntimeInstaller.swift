@@ -338,9 +338,12 @@ struct ZaloRuntimeInstaller: Sendable {
         process.standardError = stderr
         let errors = stderr.fileHandleForReading
         let name = process.executableURL?.lastPathComponent ?? tool
+        let output = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             process.terminationHandler = { process in
-                let message = String(decoding: errors.readDataToEndOfFile(), as: UTF8.self)
+                drained.wait() // the reader below hits EOF once the tool is gone
+                let message = String(decoding: output.withLock { $0 }, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if process.terminationStatus == 0 {
                     continuation.resume()
@@ -348,7 +351,14 @@ struct ZaloRuntimeInstaller: Sendable {
                     continuation.resume(throwing: Failure(message: "\(name) lỗi \(process.terminationStatus): \(message)"))
                 }
             }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+            do { try process.run() } catch { continuation.resume(throwing: error); return }
+            // Drain stderr while the tool runs: reading only after exit deadlocks once it fills the 64 KB pipe
+            // buffer (the tool blocks on write, never exits, the termination handler never runs).
+            DispatchQueue.global(qos: .utility).async {
+                let data = errors.readDataToEndOfFile()
+                output.withLock { $0 = data }
+                drained.signal()
+            }
         }
     }
 }

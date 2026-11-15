@@ -190,10 +190,23 @@
     last[key] = k;
     post({ [key]: value });
   };
+  // The friend list (thousands of rows) goes out at once when a friend's data changes (added / removed / renamed / new avatar);
+  // when only presence moved (`online` flips, `lastActive` minute advances) at most every PRESENCE_MS. The row shape is unchanged
+  // (Swift reads `online` as sent).
+  const PRESENCE_MS = 30000;
+  let friendsData = '', friendsPresence = '', friendsAt = 0;
+  const emitFriends = (list) => {
+    if (!list) return;
+    const data = JSON.stringify(list.map((f) => [f.id, f.name, f.zaloName, f.avatar]));
+    const presence = JSON.stringify(list.map((f) => [f.lastActive, f.online]));
+    if (data === friendsData && (presence === friendsPresence || Date.now() - friendsAt < PRESENCE_MS)) return;
+    friendsData = data; friendsPresence = presence; friendsAt = Date.now();
+    post({ friends: list });
+  };
   const publish = () => {
     if (!resolve()) return;
-    const step = (name, fn) => { try { fn(); } catch (e) { diag('publish ' + name + ' failed: ' + e); } };
-    step('friends', () => emit('friends', mapFriends()));
+    const step = (name, fn) => { try { fn(); } catch (e) { diag('publish ' + name + ' failed: ' + (e && e.name ? e.name : typeof e)); } };
+    step('friends', () => emitFriends(mapFriends()));
     step('groups', () => emit('groups', mapGroups()));
     step('received', () => { const received = receivedNow(); if (received) { emit('received', received); emit('pendingRequestCount', received.length); } });
     step('sent', () => emit('sent', sent));

@@ -199,13 +199,20 @@ enum FileManagerBridge {
         func path(_ dir: String?, _ name: String) -> String {
             URL(fileURLWithPath: dir ?? platform.userData.path).appendingPathComponent(name).path
         }
+        /// Reads are confined to `FileSystemBridge.readableRoots` (issue #1.3); outside them → EACCES.
+        func readable(_ path: String) throws -> String {
+            guard FileSystemBridge.isReadable(path, platform: platform) else {
+                throw FileSystemBridge.FSError(code: "EACCES", path: path)
+            }
+            return path
+        }
 
         bridge.sync("$zFileManager.getSentryConfig") { _ in nil }
         bridge.async("$zFileManager.saveSentryConfig") { _ in nil }
         // Viewer key: <userData>/z_u.txt; must reject when missing.
         bridge.async("$zFileManager.getViewerkey") { args in
             let file = path(args.string(0), "z_u.txt")
-            guard let data = fm.contents(atPath: file) else {
+            guard FileSystemBridge.isReadable(file, platform: platform), let data = fm.contents(atPath: file) else {
                 throw ZaloBridge.BridgeError(message: "z_u.txt not found")
             }
             return String(decoding: data, as: UTF8.self)
@@ -260,21 +267,21 @@ enum FileManagerBridge {
             throw ZaloBridge.BridgeError(message: "ENOENT: install source")
         }
 
-        // File access for attachments the user picked (paths come from open panels).
+        // File access by path (the renderer's own downloads / caches; picked files reach the page as WebKit `File`s).
         bridge.async("$zFileManager.getFileArrayBuffer") { args in
-            guard let data = fm.contents(atPath: args.string(0) ?? "") else {
+            guard let data = fm.contents(atPath: try readable(args.string(0) ?? "")) else {
                 throw FileSystemBridge.FSError(code: "ENOENT", path: args.string(0) ?? "")
             }
             return CryptoBridge.ArrayBufferValue(data: data)
         }
         bridge.async("$zFileManager.readFileAsync") { args in
-            guard let data = fm.contents(atPath: args.string(0) ?? "") else {
+            guard let data = fm.contents(atPath: try readable(args.string(0) ?? "")) else {
                 throw FileSystemBridge.FSError(code: "ENOENT", path: args.string(0) ?? "")
             }
             return args.string(1) == nil ? data : String(decoding: data, as: UTF8.self)
         }
         bridge.async("$zFileManager.svcStatAsync") { args in
-            let attrs = try fm.attributesOfItem(atPath: args.string(0) ?? "")
+            let attrs = try fm.attributesOfItem(atPath: try readable(args.string(0) ?? ""))
             return ["size": (attrs[.size] as? NSNumber)?.intValue ?? 0]
         }
         bridge.async("$zFileManager.writeBufferToPath") { args in

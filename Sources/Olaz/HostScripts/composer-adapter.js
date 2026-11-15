@@ -119,13 +119,19 @@
   // ---- official toasts / confirms → Swift while an action runs ----
   // Each running action has a scope {convId, running, until}; it stays open a little after the action (toasts and confirms the
   // official code raises right after) and again after each confirm answer (the official chain asks the next one then).
+  // A running scope ends with its action, and at the latest SCOPE_MS after it began: an official call that never settles must
+  // not keep every later toast / confirm of the page. Each awaited official send call is capped at SEND_MS ('pending').
+  const SCOPE_MS = 120000, SEND_MS = 90000;
+  const TIMEOUT = { olazTimeout: true };
+  const official = (p) => Promise.race([Promise.resolve(p), sleep(SEND_MS).then(() => { throw TIMEOUT; })]);
   const scopes = new Set();
   const confirms = new Map();  // token → {params, scope}
   const LOAD = Math.random().toString(36).slice(2, 8);   // tokens of an earlier page never match this one's
   let nextToken = 1;
   const liveScope = () => {
     let last = null;
-    for (const s of scopes) { if (s.running || Date.now() < s.until) last = s; else scopes.delete(s); }
+    const now = Date.now();
+    for (const s of scopes) { if ((s.running && now - s.started < SCOPE_MS) || now < s.until) last = s; else scopes.delete(s); }
     return last;
   };
   const inScope = () => !!liveScope();
@@ -152,6 +158,7 @@
   const hook = () => {
     scan();
     pinResizerConfig();
+    pinJxlConfig();
     if (hooked || !M.toast || !M.confirm || !M.modal) return hooked;
     const t = M.toast;
     if (!t.__olazCompose) {
@@ -216,10 +223,16 @@
   };
   const withScope = async (convId, work) => {
     hook();
-    const mine = { convId: String(convId), running: true, until: 0 };
+    const mine = { convId: String(convId), running: true, until: 0, started: Date.now() };
     scopes.add(mine);
-    try { return await work(); } catch (e) { diag('action ' + scrubErr(e)); return { status: 'error' }; }
-    finally { mine.running = false; mine.until = Date.now() + 2500; core.refresh(); }
+    const pending = { status: 'pending', text: PENDING_TEXT };
+    try {
+      // Whatever the work awaits, the caller gets an answer by SCOPE_MS (the work itself is left to finish on its own).
+      return await Promise.race([Promise.resolve().then(work), sleep(SCOPE_MS).then(() => { throw TIMEOUT; })]);
+    } catch (e) {
+      if (e === TIMEOUT) { diag('action timed out'); return pending; }
+      diag('action ' + scrubErr(e)); return { status: 'error' };
+    } finally { mine.running = false; mine.until = Date.now() + 2500; core.refresh(); }
   };
 
   // DEVIATION FROM OFFICIAL (remote config `image_resizer.enable_libvips_macos` and `jxl.enable_upload` / `jxl.enable_upload_e2ee`).
@@ -251,6 +264,26 @@
       Object.defineProperty(c, 'jxl', { configurable: true, enumerable: true, get: () => patchedJxl(jxlValue), set: (v) => { jxlValue = v; } });
       Object.defineProperty(c, '__olazResizer', { value: true });
     } catch (e) { diag('resizer config ' + scrubErr(e)); }
+    return true;
+  };
+
+  // DEVIATION FROM OFFICIAL (remote config `jxl.enable_upload` / `enable_upload_e2ee`). With either on, the photo processor
+  // (`_preprocessBlobPhoto`) re-encodes every resized photo to JPEG XL before the message is created, through the native libjxl
+  // module of Zalo PC, which this host does not have (local-modules.js answers `$zFeatures.libjxl` as unavailable): the encode
+  // job never settles, so a photo (attach button, paste, screenshot) stops after its preview thumbnail and is never sent. With
+  // the switches off the photo goes as JPEG, the path of clients without libjxl (Zalo Web). Held off across remote-config
+  // refreshes (they assign `jxl` anew); the switch values the server sends are logged, never anything else.
+  const pinJxlConfig = () => {
+    const c = S.cfg;
+    if (!c || c.__olazJxl) return !!c;
+    let value = c.jxl;
+    const note = (when, v) => diag(`jxl ${when}: enable_upload=${safe(() => v && v.enable_upload, '?')} enable_upload_e2ee=${safe(() => v && v.enable_upload_e2ee, '?')}`);
+    note('config', value);
+    const patched = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.assign({}, v, { enable_upload: false, enable_upload_e2ee: false }) : v);
+    try {
+      Object.defineProperty(c, 'jxl', { configurable: true, enumerable: true, get: () => patched(value), set: (v) => { value = v; note('config refreshed', v); } });
+      Object.defineProperty(c, '__olazJxl', { value: true });
+    } catch (e) { diag('jxl config ' + scrubErr(e)); }
     return true;
   };
 
@@ -443,7 +476,7 @@
           safe(() => M.overlimit && M.overlimit.b({ [e.code]: [photos[0]] }, box.cc.windowId, box.cc._sendOverlimitPhoto.bind(box.cc, targetConv)), null);
         }
       } else {
-        if (photos.length) await box.cc._uploadImg({ target: { files: photos, value: '' } }, Object.assign({}, box.info), SRC().Photo.CLICK_ICON_SEND_PHOTO, false);
+        if (photos.length) await official(box.cc._uploadImg({ target: { files: photos, value: '' } }, Object.assign({}, box.info), SRC().Photo.CLICK_ICON_SEND_PHOTO, false));
         if (others.length) uploadAsFiles(box, others);
       }
       diag(`media photos=${photos.length} files=${others.length}`);
@@ -457,12 +490,12 @@
     const opts = { isPasted: false, isUploaded: true, withoutPreview: true, targetConv: Object.assign({}, box.info), sendSource: SRC().Photo.SEND_FROM_SCREENSHOT };
     if (fromMe) opts.isFromScreenshot = true;
     try {
-      await box.cc._uploadDragPhoto(file, opts);
+      await official(box.cc._uploadDragPhoto(file, opts));
     } catch (e) {
-      if (!e || !e.code) throw e;
+      if (!e || !e.code || e === TIMEOUT) throw e;
       // The processor refused the photo: the official notice, then the shot goes as a file.
       safe(() => M.overlimit && M.overlimit.a({ [e.code]: [file] }, box.cc.windowId), null);
-      await box.cc._uploadDragFile(file, { isPasted: false, isUploaded: true, withoutPreview: true, targetConv: Object.assign({}, box.info), isFromScreenshot: !!fromMe });
+      await official(box.cc._uploadDragFile(file, { isPasted: false, isUploaded: true, withoutPreview: true, targetConv: Object.assign({}, box.info), isFromScreenshot: !!fromMe }));
     }
   };
   const sendShot = (convId, toMe) => {
@@ -494,9 +527,13 @@
         const box = await boxOrStatus(id, false);
         if (box.status) continue;
         try {
-          await box.cc.sendPhotoMessage(file, { targetConv: Object.assign({}, box.info), sendSource: SRC().Photo.SEND_FROM_SCREENSHOT });
+          await official(box.cc.sendPhotoMessage(file, { targetConv: Object.assign({}, box.info), sendSource: SRC().Photo.SEND_FROM_SCREENSHOT }));
           sent++;
-        } catch (e) { diag('share shot ' + scrubErr(e)); }
+        } catch (e) {
+          // A hung send: the later ones would hang the same way; the shot may still go out.
+          if (e === TIMEOUT) { diag('share shot timed out'); return { status: 'pending', text: PENDING_TEXT, sent }; }
+          diag('share shot ' + scrubErr(e));
+        }
       }
       return sent ? { status: 'done', sent } : { status: 'error' };
     });
@@ -653,4 +690,8 @@
   // Hooks go in early so a toast of the first action is not missed.
   const boot = setInterval(() => { if (hook()) clearInterval(boot); }, 2000);
   setTimeout(() => clearInterval(boot), 120000);
+  // The config pins go in as soon as chat-adapter.js has resolved the remote config (`S.cfg`), before the first photo is
+  // processed — not only once the toast / confirm hooks are found. A property check per tick; stops once both are in.
+  const pinBoot = setInterval(() => { if (pinResizerConfig() && pinJxlConfig()) clearInterval(pinBoot); }, 250);
+  setTimeout(() => clearInterval(pinBoot), 600000);
 })();

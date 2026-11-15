@@ -43,9 +43,29 @@ extension ZaloEngine {
         guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
               let json = String(data: data, encoding: .utf8) else { return false }
         let script = "const c = window.__zaloChat; if (!c || !c.sendText) return 'missing'; return await c.sendText(...\(json));"
-        let result = await host?.evaluate(script) as? String
+        // A hung official send must not spin forever. No answer in time means "may still be sent": reported as pending and
+        // treated as taken (true), so the text is not handed back as failed and re-sent into a duplicate.
+        guard let answer = await raceTimeout(Self.sendTextTimeout, { [self] in JSBox(value: await host?.evaluate(script)) }) else {
+            EngineLog.shared.write("chat sendText → no answer in \(Int(Self.sendTextTimeout)) s (pending)")
+            CardActionCenter.shared.show(CardActionOutcome.noAnswerText, in: id)
+            return true
+        }
+        let result = answer.value as? String
         if result != "sent" { EngineLog.shared.write("chat sendText → \(result ?? "nil")") }
         return result == "sent"
+    }
+
+    /// Swift-side cap on one official text send (the page's own network retries normally answer well before).
+    static let sendTextTimeout: Double = 60
+
+    /// Logout: messages, history paging and typing banners of the previous account.
+    func resetChatState() {
+        messages = [:]
+        hasMoreHistory = [:]
+        historyTicks = [:]
+        typing = [:]
+        ChatTypingClock.tasks.values.forEach { $0.cancel() }
+        ChatTypingClock.tasks = [:]
     }
 
     /// Group members matching `query` (what follows the "@"), from the official suggestion engine:

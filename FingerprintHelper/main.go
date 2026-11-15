@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 const (
@@ -44,13 +45,27 @@ func main() {
 	_ = os.Chmod(*socketPath, 0o700)
 
 	// Die with the parent (Olaz terminates us explicitly, this is the backstop) and on signals.
+	shutdown := func() {
+		listener.Close()
+		os.Remove(*socketPath)
+		os.Exit(0)
+	}
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigs
-		listener.Close()
-		os.Remove(*socketPath)
-		os.Exit(0)
+		shutdown()
+	}()
+	// A crashed or force-quit Olaz never sends SIGTERM: we get reparented to launchd and would
+	// otherwise linger forever (one orphan per crash). Exit once the parent is gone.
+	parent := os.Getppid()
+	go func() {
+		for range time.Tick(time.Second) {
+			if os.Getppid() != parent {
+				log.Printf("parent %d gone, exiting", parent)
+				shutdown()
+			}
+		}
 	}()
 
 	log.Printf("fingerprint-helper v%d (%s) listening on %s", helperVersion, profileName, *socketPath)

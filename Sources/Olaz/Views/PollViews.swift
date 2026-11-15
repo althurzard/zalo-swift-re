@@ -487,7 +487,7 @@ struct PollDetailSheet: View {
             get: { self.draft?.added.first { $0.id == row.id }?.text ?? row.text },
             set: { text in
                 guard var next = self.draft, let at = next.added.firstIndex(where: { $0.id == row.id }) else { return }
-                next.added[at].text = String(text.prefix(config.maxOption))
+                next.added[at].text = text.limitedUTF16(config.maxOption)
                 self.draft = next
             })
         let empty = row.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -579,8 +579,10 @@ struct PollDetailSheet: View {
     }
 
     private func submit() async {
-        guard let detail, let draft, !busy else { return }
+        guard let detail, var draft, !busy else { return }
         busy = true; message = nil
+        // A field left while composing may still be over the limit.
+        for index in draft.added.indices { draft.added[index].text = draft.added[index].text.prefixUTF16(config.maxOption) }
         let result = await engine.votePoll(pollId, in: conversationId, draft: draft, detail: detail)
         busy = false
         if result.ok { dismiss() } else { message = result.message(for: .vote) }
@@ -639,6 +641,9 @@ struct PollCreateSheet: View {
     @State private var busy = false
     @State private var message: String?
     @State private var confirmDiscard = false
+    /// Stable row identities for `draft.options` (same order and count): removing an option must not hand its field, focus
+    /// and IME state to the next one, as index ids did.
+    @State private var optionIDs: [UUID] = []
 
     private var config: PollConfig { caps.config }
     private var issue: PollCreateDraft.Issue? { draft.issue(config: config) }
@@ -663,7 +668,10 @@ struct PollCreateSheet: View {
             loaded = true
             let minimum = caps.config.minOptions
             if draft.options.count < minimum { draft.options += Array(repeating: "", count: minimum - draft.options.count) }
+            syncOptionIDs()
         }
+        .onAppear(perform: syncOptionIDs)
+        .onChange(of: draft.options.count) { _, _ in syncOptionIDs() }
         .confirmationDialog("Bạn muốn hủy tạo bình chọn?", isPresented: $confirmDiscard, titleVisibility: .visible) {
             Button("Hủy tạo bình chọn", role: .destructive) { dismiss() }
             Button("Không", role: .cancel) {}
@@ -679,24 +687,24 @@ struct PollCreateSheet: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text("Chủ đề bình chọn").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-                TextField("Nội dung bình chọn?", text: Binding(get: { draft.question }, set: { draft.question = String($0.prefix(config.maxQuestion)) }), axis: .vertical)
+                TextField("Nội dung bình chọn?", text: Binding(get: { draft.question }, set: { draft.question = $0.limitedUTF16(config.maxQuestion) }), axis: .vertical)
                     .lineLimit(1...4).textFieldStyle(.roundedBorder)
             }
             VStack(alignment: .leading, spacing: 6) {
                 Text("Các lựa chọn").font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
-                ForEach(draft.options.indices, id: \.self) { index in
+                ForEach(Array(optionIDs.prefix(draft.options.count).enumerated()), id: \.element) { index, _ in
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             TextField("Lựa chọn \(index + 1)", text: Binding(
                                 get: { draft.options.indices.contains(index) ? draft.options[index] : "" },
-                                set: { if draft.options.indices.contains(index) { draft.options[index] = String($0.prefix(config.maxOption)) } }))
+                                set: { if draft.options.indices.contains(index) { draft.options[index] = $0.limitedUTF16(config.maxOption) } }))
                                 .textFieldStyle(.roundedBorder)
                                 .onSubmit {
                                     if index == draft.options.count - 1, !draft.options[index].trimmingCharacters(in: .whitespaces).isEmpty,
-                                       draft.options.count < config.maxOptions, !draft.isDuplicate(at: index) { draft.options.append("") }
+                                       draft.options.count < config.maxOptions, !draft.isDuplicate(at: index) { appendOption() }
                                 }
                             if draft.options.count > config.minOptions {
-                                Button("Xóa lựa chọn", systemImage: "xmark.circle.fill") { if draft.options.indices.contains(index) { draft.options.remove(at: index) } }
+                                Button("Xóa lựa chọn", systemImage: "xmark.circle.fill") { removeOption(at: index) }
                                     .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
                             }
                         }
@@ -705,7 +713,7 @@ struct PollCreateSheet: View {
                         }
                     }
                 }
-                Button("Thêm lựa chọn", systemImage: "plus") { draft.options.append("") }
+                Button("Thêm lựa chọn", systemImage: "plus") { appendOption() }
                     .buttonStyle(.glass)
                     .disabled(draft.options.count >= config.maxOptions || draft.options.indices.contains { draft.isDuplicate(at: $0) })
             }
@@ -787,11 +795,35 @@ struct PollCreateSheet: View {
 
     private func requestClose() { if isDirty { confirmDiscard = true } else { dismiss() } }
 
+    private func appendOption() {
+        syncOptionIDs()
+        draft.options.append("")
+        optionIDs.append(UUID())
+    }
+
+    private func removeOption(at index: Int) {
+        guard draft.options.indices.contains(index) else { return }
+        syncOptionIDs()
+        draft.options.remove(at: index)
+        optionIDs.remove(at: index)
+    }
+
+    /// Options added or dropped elsewhere (the minimum filled in on load) get / lose ids at the end.
+    private func syncOptionIDs() {
+        let count = draft.options.count
+        if optionIDs.count < count { optionIDs += (optionIDs.count..<count).map { _ in UUID() } }
+        else if optionIDs.count > count { optionIDs.removeLast(optionIDs.count - count) }
+    }
+
     /// WRITE: runs only from the "Tạo bình chọn" button.
     private func create() async {
         guard issue == nil, caps.canCreate, !busy else { return }
         busy = true; message = nil
-        let result = await engine.createPoll(in: conversationId, draft: draft, config: config, canPin: caps.canPin)
+        // A field left while composing may still be over the limit.
+        var sent = draft
+        sent.question = sent.question.prefixUTF16(config.maxQuestion)
+        sent.options = sent.options.map { $0.prefixUTF16(config.maxOption) }
+        let result = await engine.createPoll(in: conversationId, draft: sent, config: config, canPin: caps.canPin)
         busy = false
         if result.ok {
             if result.pinSkipped {

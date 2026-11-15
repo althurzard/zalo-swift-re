@@ -163,6 +163,8 @@ struct CloudActionResult: Sendable {
     var deleted: [String] = []
     var failed: [String] = []
     var error: String?
+    /// No answer (timeout / page reload): the write may still have happened — check again, don't retry blindly.
+    var pending = false
 }
 
 extension ZaloEngine {
@@ -208,20 +210,52 @@ extension ZaloEngine {
 
     /// WRITE: removes the items the way the official "Xoá dữ liệu" confirmation does (sync-delete of the messages).
     func cloudDelete(_ keys: [String]) async -> CloudActionResult {
-        guard let json = await callCloud("deleteItems", keys) as? [String: Any] else {
-            return CloudActionResult(ok: false, failed: keys, error: "Chưa kết nối được tới zCloud.")
+        switch await cloudWrite("deleteItems", keys) {
+        case .notConnected:
+            return CloudActionResult(ok: false, failed: keys, error: Self.cloudNotConnectedText)
+        case .unknown:
+            // Nothing is known as failed: the caller reloads the list (the truth) instead of offering a retry.
+            return CloudActionResult(ok: false, error: CardActionOutcome.noAnswerText, pending: true)
+        case .answer(let json):
+            return CloudActionResult(ok: json["ok"] as? Bool ?? false, deleted: json["deleted"] as? [String] ?? [],
+                                     failed: json["failed"] as? [String] ?? [],
+                                     error: (json["error"] as? String).flatMap { $0.isEmpty ? nil : $0 })
         }
-        return CloudActionResult(ok: json["ok"] as? Bool ?? false, deleted: json["deleted"] as? [String] ?? [],
-                                 failed: json["failed"] as? [String] ?? [],
-                                 error: (json["error"] as? String).flatMap { $0.isEmpty ? nil : $0 })
     }
 
     /// WRITE: Settings ▸ "Tự động giải phóng dung lượng" (official `changeEnableOffload`).
     func cloudSetOffload(_ enabled: Bool) async -> CloudActionResult {
-        guard let json = await callCloud("setOffload", enabled) as? [String: Any] else {
-            return CloudActionResult(ok: false, error: "Chưa kết nối được tới zCloud.")
+        switch await cloudWrite("setOffload", enabled) {
+        case .notConnected: return CloudActionResult(ok: false, error: Self.cloudNotConnectedText)
+        case .unknown: return CloudActionResult(ok: false, error: CardActionOutcome.noAnswerText, pending: true)
+        case .answer(let json): return CloudActionResult(ok: json["ok"] as? Bool ?? false, error: json["error"] as? String)
         }
-        return CloudActionResult(ok: json["ok"] as? Bool ?? false, error: json["error"] as? String)
+    }
+
+    private static let cloudNotConnectedText = "Chưa kết nối được tới zCloud."
+    /// Swift-side cap on one zCloud write.
+    private static let cloudWriteTimeout: Double = 90
+
+    private enum CloudWriteAnswer {
+        case answer([String: Any])
+        /// Nothing was started (no page / adapter not installed).
+        case notConnected
+        /// No answer in time, or the call threw (page reloaded): the write may still have happened.
+        case unknown
+    }
+
+    /// A zCloud WRITE with a bounded wait that tells "never started" from "started, outcome unknown".
+    private func cloudWrite(_ method: String, _ args: Any) async -> CloudWriteAnswer {
+        guard let host, let data = try? JSONSerialization.data(withJSONObject: [args], options: [.fragmentsAllowed]),
+              let json = String(data: data, encoding: .utf8) else { return .notConnected }
+        let script = "const c = window.__zaloCloud; if (!c || !c.\(method)) return 'missing'; return await c.\(method)(...\(json));"
+        let answer = await raceTimeout(Self.cloudWriteTimeout) { JSBox(value: await host.evaluate(script)) }
+        guard let value = answer?.value else {
+            EngineLog.shared.write("cloud \(method) → no answer (pending)")
+            return .unknown
+        }
+        guard let dict = value as? [String: Any] else { return .notConnected }   // 'missing' or an unexpected shape
+        return .answer(dict)
     }
 
     /// `await window.__zaloCloud[method](...args)`; arguments are JSON-encoded.

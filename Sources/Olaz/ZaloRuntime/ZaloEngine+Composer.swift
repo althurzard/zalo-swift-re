@@ -212,6 +212,11 @@ extension ZaloEngine {
         stagedImages[id] = Array((items + existing).prefix(Self.maxStagedImages))
     }
 
+    /// A pasted picture: the screenshot "Gửi" path (`_uploadDragPhoto`, how Zalo PC sends a pasted image), one photo per call.
+    func sendPastedImage(_ url: URL, to id: String) async -> ComposerOutcome {
+        await composeWithFiles("sendShot", [id, false], files: [url])
+    }
+
     /// "Tệp": the official file button's path.
     func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
         let prepared = Self.prepareAttachmentURLs(urls, convertUnsupportedPhotos: false)
@@ -493,6 +498,7 @@ extension ZaloEngine {
 
     private func composeWithFiles(_ method: String, _ args: [Any], files: [URL]) async -> ComposerOutcome {
         guard !files.isEmpty else { return .cancelled }
+        EngineLog.shared.write("compose \(method) start files=\(files.count)")
         // Photos are processed (resized) before the call returns; the uploads themselves continue in the page.
         let answer = await raceTimeout(45) { [self] in JSBox(value: await callCompose(method, args, files: files)) }
         guard let answer else {

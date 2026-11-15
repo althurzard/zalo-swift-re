@@ -40,15 +40,28 @@
   // ---- channel broker (main.js MsgChannel manager, SQLite host only) ----
   let sessionSeq = 0;
   const channels = new Map(); // `${requester}|${channelID}` → {requester, channelID, sessionID, port, established}
-  const emitWhenListened = (channel, args, ports, tries = 50) => {
+  // Waits up to 10 s for the page to listen; on giving up the push is dropped, logged, and `onGiveUp` runs (cleanup).
+  const emitWhenListened = (channel, args, ports, tries = 50, onGiveUp = null) => {
     const bridge = window.__zaloBridge;
     if (bridge.ipcHasListener(channel)) { ports ? bridge.ipcEmitPorts(channel, args, ports) : bridge.ipcEmit(channel, args); return; }
-    if (tries <= 0) { diag('no listener for ' + channel); return; }
-    setTimeout(() => emitWhenListened(channel, args, ports, tries - 1), 200);
+    if (tries <= 0) {
+      diag('gave up on ' + channel + ': no listener after 10 s, push dropped');
+      if (onGiveUp) { try { onGiveUp(); } catch (e) { diag('give-up cleanup failed: ' + scrub(e)); } }
+      return;
+    }
+    setTimeout(() => emitWhenListened(channel, args, ports, tries - 1, onGiveUp), 200);
   };
   const local = window.__zaloLocal = window.__zaloLocal || {};
   local['$zMsgChannel.requestOpenChannelTo'] = (current, target, channelID) => {
-    if (target !== HOST) { diag('channel to ' + target + ' not supported'); return Promise.resolve(); }
+    // Another target would never get its port. The call is a NOTIFY (its promise is ignored by the official `requestOpenChannelTo`,
+    // which waits for a port-transferred push), so the failure is reported the way main.js reports a target that is gone: the
+    // official `channel-terminated` push for that script, which rejects the pending request (and its container) instead of
+    // leaving it waiting forever.
+    if (target !== HOST) {
+      diag('channel to ' + target + ' not supported: reported as terminated');
+      setTimeout(() => emitWhenListened('channel-terminated', [String(target)], null), 0);
+      return Promise.resolve();
+    }
     const key = current + '|' + channelID;
     if (channels.has(key)) { diag('channel ' + channelID + ' from ' + current + ' already exists'); return Promise.resolve(); }
     const pair = new MessageChannel();
@@ -57,7 +70,11 @@
     listen(channel);
     const data = { channelID, channelSessionID: channel.sessionID, isReconnect: false, nameOfCurrentScript: current, nameOfTargetScript: HOST };
     // The official main answers over IPC, after the request returned.
-    setTimeout(() => emitWhenListened('port-transferred-v2', [data], [pair.port1]), 0);
+    // Undelivered: the channel is dropped so a later request for it opens a fresh one (not "already exists" with no port).
+    setTimeout(() => emitWhenListened('port-transferred-v2', [data], [pair.port1], 50, () => {
+      if (channels.get(key) === channel) channels.delete(key);
+      try { pair.port1.close(); pair.port2.close(); } catch {}
+    }), 0);
     diag('channel ' + channelID + ' opened for ' + current);
     return Promise.resolve();
   };

@@ -86,8 +86,31 @@
   const PRED_KEYS = ['u', 'O', 'h', 'E', 'G', 'S', 'cb', 'db', 'P', 'o', 'r', 's', 'F', 'l', 'I', 'R'];
   const pred = () => { const p = mod('dm9D'); return p && PRED_KEYS.every((k) => fn(p, k)) ? p : null; };
   const consts = () => { const c = mod('1pet'); return c && c.MSG_TOPIC !== undefined && c.CONVERSATION_TYPE ? c : null; };
-  const cfg = () => safe(() => mod('NDmK').default, null) || {};
-  const lang = (key, args) => safe(() => { const l = mod('c51z').default; return args ? l.trans(key, args) : l.str(key); }, '') || '';
+  // Modules looked up by id are used only when they have the expected shape (a Zalo update can renumber them). What the safety
+  // checks read from them fails CLOSED when it is missing: delete asks for confirmation, a conversation counts as protected
+  // ("Chặn chia sẻ": no forward / copy / star) — see `confOk`, `protectedOf`. Each miss is logged once.
+  const missed = new Set();
+  const miss = (what) => { if (!missed.has(what)) { missed.add(what); diag('module missing or changed: ' + what + ' (failing closed)'); } };
+  const hasOwn = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+  const isConf = (c) => !!c && typeof c === 'object' && hasOwn(c, 'sendToMeId') && hasOwn(c, 'stickerUrl');
+  // The remote config (`NDmK`), else the one chat-adapter.js resolved by shape; null when neither is there.
+  const confOk = () => {
+    const c = safe(() => mod('NDmK').default, null);
+    if (isConf(c)) return c;
+    const s = safe(() => core.S.cfg, null);
+    if (isConf(s)) return s;
+    miss('config');
+    return null;
+  };
+  const cfg = () => confOk() || {};
+  const langMod = () => { const l = safe(() => mod('c51z').default, null); return fn(l, 'str') && fn(l, 'trans') ? l : (miss('lang'), null); };
+  const lang = (key, args) => safe(() => { const l = langMod(); return l ? (args ? l.trans(key, args) : l.str(key)) : ''; }, '') || '';
+  // "Chặn chia sẻ" of a conversation; true when the privacy module cannot answer.
+  const protectedOf = (convId) => {
+    const m = safe(() => mod('czzM').ConversationPrivacy.GetModule(), null);
+    if (!fn(m, 'isContentProtected')) { miss('privacy'); return true; }
+    try { return !!m.isContentProtected(convId); } catch (e) { miss('privacy'); return true; }
+  };
   const timeNow = () => num(safe(() => mod('bUXd').default.getTimeNow(), 0)) || Date.now();
   // Official strings (lang_vi.json) for when the string table is not reachable.
   const TEXT = {
@@ -123,7 +146,7 @@
     if (hit && Date.now() - hit.at < 1000) return hit;
     const CT = safe(() => consts().CONVERSATION_TYPE, {}) || {};
     const type = safe(() => mod('jSEC').a(convId), CT.UNKNOWN);
-    const isProtected = safe(() => !!mod('czzM').ConversationPrivacy.GetModule().isContentProtected(convId), false);
+    const isProtected = protectedOf(convId);
     const oa = type === CT.FRIEND && safe(() => !!mod('UiPd').default.isOA(convId), false);
     let pinChat = false;
     // Official `he` chat part: not unknown / My Cloud, not an OA, groups by allowance.
@@ -340,7 +363,9 @@
     // A single-sticker group is deleted through its sticker, as the official item does.
     const target = P.F(raw) && raw.message[0] ? raw.message[0] : raw;
     const mine = String(target.fromUid) === '0' || String(target.fromUid) === meNow();
-    if (!confirmed && mine && cfg().enable_popup_confim_del) {
+    // Unknown config: the confirmation is asked (fail closed).
+    const conf = confOk();
+    if (!confirmed && mine && (!conf || conf.enable_popup_confim_del)) {
       return { status: 'confirm', title: T('STR_POPUP_DELETE_MSG_TITLE'), message: T('STR_POPUP_DELETE_MSG_DES'),
         ok: T('STR_POPUP_DELETE_MSG_BT_DEL'), cancel: T('STR_POPUP_DELETE_MSG_BT_CLOSE') };
     }
@@ -584,7 +609,7 @@
     const p = { client_msg_id: m.cliMsgId, global_msg_id: m.msgId, senderUid: from, senderName: str(m.dName) };
     const o = m.message && typeof m.message === 'object' && !Array.isArray(m.message) ? m.message : {};
     const thumbOf = () => o.thumbUrl || o.normalUrl || o.oriUrl;
-    const J = inGroup ? null : mod('Q8nW');
+    const J = inGroup ? null : ((j) => (['g', 'd', 'k', 'o', 'l', 'm'].every((k) => fn(j, k)) ? j : null))(mod('Q8nW'));
     const jxlPin = () => !!safe(() => conf.jxl && conf.jxl.enable_pin_jxl, false);
     switch (m.msgType) {
       case C.MSG_CONTACT: {
@@ -808,7 +833,7 @@
   // "Chặn chia sẻ" read now (not from the memo `describe` uses): native Copy asks before writing the pasteboard.
   const isProtected = async (convId) => {
     convId = String(convId);
-    if (!(await core.ready())) return false;
+    if (!(await core.ready())) return true;   // unknown → protected (fail closed)
     ctxCache.delete(convId);
     return !!ctxOf(convId).protected;
   };

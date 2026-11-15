@@ -323,7 +323,8 @@ private final class CallHarness {
         let got = await h.wait("3 messages") { native.received.count >= 3 }
         #expect(got)
         let received = native.received
-        #expect(received.count == 3)
+        // `#require`: on a slow machine the wait can time out with fewer messages; fail instead of indexing out of range.
+        try #require(received.count == 3)
         #expect(received[0].contains("\"command\":\"init\""))
         #expect(received[1].contains("\"act\":\"x\""))
         #expect(received[2] == big)   // multi-chunk message arrives intact

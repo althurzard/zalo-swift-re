@@ -697,10 +697,18 @@ actor MediaLoader {
         guard FileManager.default.createFile(atPath: temp.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
         }
-        let handle = try FileHandle(forWritingTo: temp)
+        let handle: FileHandle
+        do { handle = try FileHandle(forWritingTo: temp) } catch {
+            try? FileManager.default.removeItem(at: temp)
+            throw error
+        }
         let expected = expectedBytes(head)
+        // Content-Length counts the wire bytes: only comparable when the body was not content-decoded.
+        let encoding = head.headers.first { $0.0.lowercased() == "content-encoding" }?.1.lowercased()
+        let checkLength = encoding == nil || encoding == "identity"
         do {
             var received = 0
+            var ended = false
             for try await event in events {
                 switch event {
                 case .chunk(let data):
@@ -708,8 +716,15 @@ actor MediaLoader {
                     received += data.count
                     progress?.report(received: received, total: expected)
                 case .end:
-                    break
+                    ended = true
                 }
+            }
+            // A cancelled consumer's stream just stops (no `.end`, no error): never return a cut body as complete,
+            // it would be moved into the cache for good.
+            try Task.checkCancellation()
+            guard ended else { throw FingerprintProxy.Error.connectionLost("body stream ended without END") }
+            if checkLength, let expected, received != expected {
+                throw FingerprintProxy.Error.connectionLost("body truncated: \(received) of \(expected) bytes")
             }
             try handle.close()
             return temp

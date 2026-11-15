@@ -130,6 +130,9 @@ struct CloudMediaView: View {
     @State private var deleteTargets: [CloudItem] = []
     @State private var deleting = false
     @State private var notice: String?
+    /// `engine.cloud.changed` bursts (an upload or a delete fires several) coalesce into one refresh at a time.
+    @State private var refreshTask: Task<Void, Never>?
+    @State private var changeGeneration = 0
 
     init(scope: CloudScope) {
         self.scope = scope
@@ -170,12 +173,8 @@ struct CloudMediaView: View {
                 model.attach(engine)
                 await model.reload()
             }
-            .onChange(of: engine.cloud.changed) { _, _ in
-                Task {
-                    try? await Task.sleep(for: .seconds(1))
-                    await model.refreshInPlace()
-                }
-            }
+            .onChange(of: engine.cloud.changed) { _, _ in scheduleRefresh() }
+            .onDisappear { refreshTask?.cancel() }   // the task clears `refreshTask` itself; `.task(id:)` reloads on return
             .sheet(item: $preview) { item in CloudPreviewSheet(item: item) }
             .confirmationDialog(deleteTitle, isPresented: Binding(get: { !deleteTargets.isEmpty }, set: { if !$0 { deleteTargets = [] } }),
                                 titleVisibility: .visible) {
@@ -184,6 +183,24 @@ struct CloudMediaView: View {
             } message: {
                 Text("\(CloudFormat.size(deleteTargets.reduce(0) { $0 + $1.size })) dữ liệu sẽ được xoá và không thể khôi phục. Tin nhắn tương ứng cũng được xoá đồng bộ trên các thiết bị của bạn.")
             }
+    }
+
+    /// Debounced: refreshes 1 s after the last change, never two refreshes at once; a change during a refresh runs one more.
+    private func scheduleRefresh() {
+        changeGeneration += 1
+        guard refreshTask == nil else { return }
+        refreshTask = Task {
+            var handled = -1
+            while handled != changeGeneration, !Task.isCancelled {
+                let target = changeGeneration
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { break }
+                if target != changeGeneration { continue }   // still changing: wait for it to settle
+                await model.refreshInPlace()
+                handled = target
+            }
+            refreshTask = nil
+        }
     }
 
     private var deleteTitle: String { deleteTargets.count == 1 ? "Xoá dữ liệu này?" : "Xoá \(deleteTargets.count) mục?" }

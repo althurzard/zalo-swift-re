@@ -157,7 +157,7 @@
       Promise.all([S.io.getFriendManagerModule(), S.io.getGroupManagerModule()]).then(([f, g]) => {
         S.friends = f.default || f; S.groups = g.default || g;
         track.nameRetries = 0; remapAll();
-      }).catch((e) => { S.modulesLoading = false; diag('friend/group modules: ' + e); });
+      }).catch((e) => { S.modulesLoading = false; diag('friend/group modules: ' + scrubErr(e)); });
     }
     hookTyping();
     hookReactions();
@@ -876,7 +876,7 @@
         try { if (conId && result) post({ page: 'main', typing: { convId: String(conId), name: '' } }); } catch {}
         return result;
       };
-    } catch (e) { hookedTyping = false; diag('typing hook: ' + (e && e.message || e)); }
+    } catch (e) { hookedTyping = false; diag('typing hook: ' + scrubErr(e)); }
   };
 
   // ---- state publishing ----
@@ -1053,12 +1053,23 @@
     return 'sent';
   };
   let sendChain = Promise.resolve();
-  // One send at a time through the controller (text, attachments, cards).
+  // One send at a time through the controller (text, attachments, cards). A step that has not settled after STEP_MS (an
+  // official call that never answers) releases the chain so later sends are not blocked; its own promise is left as it is.
+  const STEP_MS = 60000;
   const serial = (fn) => {
-    const run = sendChain.then(fn);
-    sendChain = run.catch(() => {});
+    const prev = sendChain;
+    const run = prev.then(fn);
+    // The cap counts from when the step starts (the previous one released), not from when it was queued.
+    sendChain = prev.then(() => new Promise((release) => {
+      let done = false;
+      const go = () => { if (!done) { done = true; release(); } };
+      run.then(go, go);
+      setTimeout(() => { if (!done) { diag('send step still running after ' + STEP_MS / 1000 + ' s: chain released'); go(); } }, STEP_MS);
+    }));
     return run;
   };
+  // An official call that may never settle, capped: rejects with a 'timeout' error after `ms`.
+  const within = (p, ms, what) => Promise.race([Promise.resolve(p), sleep(ms).then(() => { throw new Error('timeout ' + what); })]);
   const refresh = () => remapAll();
 
   // Official ZTagNameHelper registry (found once in the module cache); SRC_GET_PROFILE comes from `scanModules`.
@@ -1211,7 +1222,7 @@
       } else {
         cands = loc.d([loc.b.ThumbUrl], msg);
       }
-    } catch (e) { diag('resolveMedia candidates: ' + (e && e.message || e)); }
+    } catch (e) { diag('resolveMedia candidates: ' + scrubErr(e)); }
     cands = cands.filter((c) => c && c.url);
     if (!cands.length) return done('unavailable', { reason: 'no-source' });
     // 1. A copy the official client already stored.
@@ -1243,7 +1254,7 @@
       resolveMediaNow(convId, msgId, kind),
       // A whole video downloads (and decrypts) before it plays.
       sleep(kind === 'video' ? 600000 : 60000).then(() => ({ state: 'unavailable', reason: 'timeout' })),
-    ]).catch((e) => { diag('resolveMedia ' + (e && e.message || e)); return { state: 'unavailable', reason: 'error' }; })
+    ]).catch((e) => { diag('resolveMedia ' + scrubErr(e)); return { state: 'unavailable', reason: 'error' }; })
       .finally(() => { mediaFlights.delete(key); });
     mediaFlights.set(key, flight);
     return flight;
@@ -1266,25 +1277,29 @@
       schedule();
       try {
         const cc = controller();
-        if (!cc || cc.convId !== convId || switched) await S.opener.openConversation(convId);
+        if (!cc || cc.convId !== convId || switched) await within(S.opener.openConversation(convId), 20000, 'openConversation');
         if (stale()) return;
         const settled = await waitFor(() => !stale() && convOf(convId) && controller() && controller().convId === convId, 1500);
         if (!settled && !stale()) repairController(convId, true);
         else if (settled) noteBoxFields(controller());
         if (stale()) return;
-        await S.loader.getLastMessagesForConversation(convId, {});
+        await within(S.loader.getLastMessagesForConversation(convId, {}), 30000, 'getLastMessages');
         if (stale()) { deactivate(convId); return; }
         // The chat view marks its loader active so the official in-memory message cache follows the conversation.
         safe(() => S.loader.cacheMessageLoader.get(convId).active(), null);
-      } catch (e) { diag('open ' + (e && e.message || e)); }
-      if (!stale()) { openingId = null; remapAll(); }
+      } catch (e) { diag('open ' + scrubErr(e)); }
+      finally {
+        // Every exit lets go of `openingId` unless a newer open / close owns it now (stale).
+        if (!stale()) openingId = null;
+      }
+      if (!stale()) remapAll();
     },
     async close(convId) {
       convId = String(convId);
       if (track.id === convId || openingId === convId) { openSeq++; openingId = null; }
       if (track.id === convId) track.id = null;
       deactivate(convId);
-      try { if (S.opener) await S.opener.closeConversation(convId); } catch (e) { diag('close ' + (e && e.message || e)); }
+      try { if (S.opener) await S.opener.closeConversation(convId); } catch (e) { diag('close ' + scrubErr(e)); }
     },
     async loadMore(convId) {
       convId = String(convId);
@@ -1301,7 +1316,7 @@
       try {
         const res = await cc._loadMoreMessages();
         if (Array.isArray(res)) loaded = res.length;
-      } catch (e) { diag('loadMore ' + (e && e.message || e)); }
+      } catch (e) { diag('loadMore ' + scrubErr(e)); }
       await waitFor(() => !loading(), 15000);
       await sleep(100);
       if (track.id !== convId) return;
@@ -1336,7 +1351,7 @@
           const isAll = !!x.isMentionAll || String(x.id) === '-1';
           return { id: String(x.id), name: isAll ? 'All' : (str(x.dName) || nameOf(String(x.id))), avatar: isAll ? '' : (avatarOf(String(x.id)) || str(x.avatar)), isAll };
         });
-      } catch (e) { diag('mentionCandidates ' + (e && e.message || e)); return []; }
+      } catch (e) { diag('mentionCandidates ' + scrubErr(e)); return []; }
     },
     // Who reacted to a message ("Biểu cảm" popup): the official reacted list (`{uid:{rType:count}}`) with the
     // popup's own tab / row ordering. Unknown profiles are fetched like module "7itQ" `b(uids)` does
@@ -1403,7 +1418,7 @@
       await waitFor(() => controller() && controller().convId === convId, 3000);
       const cc = controller();
       if (!cc || cc.convId !== convId) return;
-      try { await cc.readMessageOfConv(convId); } catch (e) { diag('markRead ' + (e && e.message || e)); }
+      try { await cc.readMessageOfConv(convId); } catch (e) { diag('markRead ' + scrubErr(e)); }
     },
     async react(convId, msgId, emoji) {
       convId = String(convId);
@@ -1417,7 +1432,7 @@
         S.reactSender.sendReaction(convId, reaction, clientId, target);
         const rec = S.reactCache.generateReactMsg(convId, reaction, clientId, target);
         S.reactCache.onReceiveReactions({ [rec.rMsgId]: rec }, () => {}, 'msg.sendReaction');
-      } catch (e) { diag('react ' + (e && e.message || e)); }
+      } catch (e) { diag('react ' + scrubErr(e)); }
       reactionFetched.delete(String(target.msgId));
       setTimeout(() => { fetchReactions([String(target.msgId)]); }, 500);
     },
