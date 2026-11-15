@@ -107,6 +107,15 @@ struct ConversationActionsState: Equatable {
     func isHidden(_ id: String) -> Bool { hiddenIds.contains(id) || flags(for: id).contains(.hidden) }
     func hasUnreadMark(_ id: String) -> Bool { flags(for: id).contains(.unreadMark) }
 
+    /// All conversation IDs currently considered hidden via `hiddenIds` or `.hidden` flags.
+    var allHiddenIds: Set<String> {
+        var ids = hiddenIds
+        for (id, flag) in flags where flag.contains(.hidden) {
+            ids.insert(id)
+        }
+        return ids
+    }
+
     /// Applies a `convActions` payload (the early `{hidden}` shape or the full snapshot).
     mutating func apply(json: [String: Any]) {
         if let hidden = json["hidden"] as? [String: Any] {
@@ -340,14 +349,25 @@ extension ZaloEngine {
 
     func hideConversation(_ id: String, pin: String) async -> ConversationActionResult {
         let result = await callConversationAction("hide", [id, pin])
-        if result.ok { conversationUI.remove([id]) }
+        if result.ok { applyHiddenConversation(id) }
         return result
     }
 
     func hideConversation(_ id: String, settingNewPIN pin: String) async -> ConversationActionResult {
         let result = await callConversationAction("hideWithNewPin", [id, pin])
-        if result.ok { conversationUI.remove([id]) }
+        if result.ok { applyHiddenConversation(id) }
         return result
+    }
+
+    /// Removes a newly hidden conversation from the visible UI and purges its in-memory translations
+    /// immediately before the asynchronous `convActions` snapshot arrives.
+    func applyHiddenConversation(_ id: String) {
+        applyHiddenConversation(id, translationStore: .shared)
+    }
+
+    func applyHiddenConversation(_ id: String, translationStore: MessageTranslationStore) {
+        conversationUI.remove([id])
+        translationStore.clearConversation(id)
     }
 
     /// `pin` nil = the conversation was opened with the PIN already (official `UNHIDE_CONV`, no PIN field).
@@ -437,7 +457,12 @@ extension ZaloEngine {
     // MARK: Page events
 
     func handleConversationActions(state: [String: Any]) {
+        handleConversationActions(state: state, translationStore: .shared)
+    }
+
+    func handleConversationActions(state: [String: Any], translationStore: MessageTranslationStore) {
         guard let json = state["convActions"] as? [String: Any] else { return }
+        let previouslyHidden = conversationActions.allHiddenIds
         var next = conversationActions
         next.apply(json: json)
         // The outcome of an archive / delete that had answered "pending": report it now. A new page epoch restarts the sequence.
@@ -451,6 +476,9 @@ extension ZaloEngine {
             if let removed = late["removedId"] as? String, !removed.isEmpty { conversationUI.remove([removed]) }
         }
         if next != conversationActions { conversationActions = next }
+        for id in next.allHiddenIds.subtracting(previouslyHidden) {
+            translationStore.clearConversation(id)
+        }
     }
 
     // MARK: Bridge

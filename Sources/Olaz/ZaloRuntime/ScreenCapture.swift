@@ -11,7 +11,7 @@ import CoreGraphics
 /// The tool draws its own selection / annotation toolbar. "Gửi" (`cap:acceptScrs`) and "Gửi vào Cloud của tôi" (`cap:send2meScrs`)
 /// leave the shot on the clipboard, "Chia sẻ" (`cap:forwardScrs`) hands over an image path, the OCR "share text" (`cap:forwardTextScrs`)
 /// its text. Main's "without Zalo" mode hides the windows first and restores them when the tool is done (`cap:cancelScrs` /
-/// `cap:quitAction` / exit). OCR is not offered (`zalo:ocrAvailability` answers disabled).
+/// `cap:quitAction` / exit). OCR availability checks `libzocr_vision.dylib` next to `ZaloCap` and enables in-process OCR when present.
 @MainActor
 final class ScreenCapture {
     enum Outcome {
@@ -44,6 +44,47 @@ final class ScreenCapture {
 
     nonisolated static func helperExecutable(appURL: URL = OfficialZaloInstall.defaultAppURL) -> URL {
         appURL.appendingPathComponent("Contents/ZaloHelper.app/Contents/MacOS/ZaloCap")
+    }
+
+    /// Path to `libzocr_vision.dylib` inside `ZaloHelper.app/Contents/Frameworks`, resolved relative to `ZaloCap`.
+    nonisolated static func ocrLibraryURL(forExecutable executable: URL) -> URL {
+        executable
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Frameworks/libzocr_vision.dylib")
+    }
+
+    nonisolated static func hasOCRLibrary(forExecutable executable: URL) -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: ocrLibraryURL(forExecutable: executable).path) {
+            return true
+        }
+        let fallback = executable
+            .deletingLastPathComponent()
+            .appendingPathComponent("Contents/Frameworks/libzocr_vision.dylib")
+        return fm.fileExists(atPath: fallback.path)
+    }
+
+    nonisolated static func ocrAvailabilityPayload(id: String, helperExists: Bool) -> [String: Any] {
+        if helperExists {
+            return [
+                "cmd": "zalo:ocrAvailability",
+                "data": [
+                    "idReq": id,
+                    "enabled": true,
+                    "transport": "in-process",
+                    "canShareOCRContent": true,
+                ] as [String: Any],
+            ]
+        }
+        return [
+            "cmd": "zalo:ocrAvailability",
+            "data": [
+                "idReq": id,
+                "enabled": false,
+                "reason": "unsupported",
+            ] as [String: Any],
+        ]
     }
 
     init(executable: URL = ScreenCapture.helperExecutable(),
@@ -221,10 +262,9 @@ final class ScreenCapture {
             finish()
             onOutcome?(.noPermission)
         case "cap:ocrRequest":
-            // Main asks its OCR service; there is none here.
             let request = (frame.data as? String).flatMap { (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any] } ?? frame.data as? [String: Any]
             if let id = request?["idReq"] as? String, !id.isEmpty {
-                send(["cmd": "zalo:ocrAvailability", "data": ["idReq": id, "enabled": false, "reason": "unsupported"]])
+                send(Self.ocrAvailabilityPayload(id: id, helperExists: Self.hasOCRLibrary(forExecutable: executable)))
             }
         default:
             // cap:recvReq / cap:running / cap:copyScrs / cap:saveScrs / zalo:changeDataClipboard / cap:osEvent / cap:logActionById

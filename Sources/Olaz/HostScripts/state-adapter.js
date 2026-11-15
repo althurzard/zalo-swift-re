@@ -120,7 +120,16 @@
         const publish = () => {
           const st = store.getState();
           const u = st.user || {};
-          const user = { userId: u.userId || '', displayName: u.displayName || '', zaloName: u.zaloName || '', avatar: u.avatar || '', phoneNumber: u.phoneNumber || '' };
+          const user = {
+            userId: u.userId || '',
+            displayName: u.displayName || '',
+            zaloName: u.zaloName || '',
+            avatar: u.avatar || '',
+            phoneNumber: u.phoneNumber || '',
+            gender: u.gender != null ? u.gender : null,
+            dob: u.dob != null ? u.dob : null,
+            status: u.status || '',
+          };
           const key = JSON.stringify(user);
           if (key !== lastUser) { lastUser = key; post({ page: 'main', user }); }
         };

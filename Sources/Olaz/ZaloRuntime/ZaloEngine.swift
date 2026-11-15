@@ -42,11 +42,14 @@ final class ZaloEngine {
         var isSecondQR = false
     }
 
-    struct Profile: Equatable {
+    struct Profile: Equatable, Sendable {
         var userId: String
         var displayName: String
         var avatar: URL?
         var phone: String?
+        var gender: Int? = nil
+        var dob: TimeInterval? = nil
+        var status: String? = nil
     }
 
     /// A conversation as the official client knows it (conv-info-manager + profiles).
@@ -116,6 +119,12 @@ final class ZaloEngine {
     internal(set) var contacts = ContactsState()
     /// Notification preferences mirrored from the official client (ZaloEngine+Notifications.swift).
     internal(set) var notificationSettings = NotificationSettingsState()
+    /// Privacy settings and blocklist (ZaloEngine+Privacy.swift).
+    var privacySettings: PrivacySettings?
+    var privacyLoading = false
+    var privacyError: String?
+    var blockedUsers: [BlockedUser] = []
+    var blockedUsersLoaded = false
     /// zCloud: plan, quota / usage, conversations with cloud data, settings (ZaloEngine+Cloud.swift).
     internal(set) var cloud = CloudState()
     /// Voice / video calls: renderer support, native helper status, incoming call (ZaloEngine+CallHook.swift).
@@ -307,13 +316,19 @@ final class ZaloEngine {
         resetStickers()
         resetComposer()
         resetMessageActions()
+        resetPrivacyState()
+        MessageTranslationStore.shared.clearAll()
         failedDrafts = FailedDraftStore()   // unsent text of the previous account must not show up in the next one
         refreshQR()
     }
 
+    func applyProfile(_ next: Profile) {
+        profile = next
+    }
+
     // MARK: Events from the runtime
 
-    private func handle(_ event: ZaloMainProcess.Event) {
+    func handle(_ event: ZaloMainProcess.Event) {
         EngineLog.shared.write("main-process \(event)")
         switch event {
         case .loginSucceeded:
@@ -330,6 +345,8 @@ final class ZaloEngine {
             resetStickers()
             resetComposer()
             resetMessageActions()
+            resetPrivacyState()
+            MessageTranslationStore.shared.clearAll()
             failedDrafts = FailedDraftStore()
             phase = .login(LoginState())
         case .badge:
@@ -357,7 +374,7 @@ final class ZaloEngine {
         }
     }
 
-    private func handle(state: [String: Any]) {
+    internal func handle(state: [String: Any]) {
         EngineLog.shared.write("state page=\(state["page"] ?? "-") event=\(state["event"] ?? "-") keys=\(state.keys.sorted())")
         switch state["page"] as? String {
         case "login":
@@ -413,13 +430,9 @@ final class ZaloEngine {
         case "main" where state["conversations"] != nil:
             mergeConversations(state)
         case "main":
-            if let user = state["user"] as? [String: Any], let id = user["userId"] as? String, !id.isEmpty {
-                profile = Profile(
-                    userId: id,
-                    displayName: user["displayName"] as? String ?? user["zaloName"] as? String ?? "",
-                    avatar: (user["avatar"] as? String).flatMap(URL.init(string:)),
-                    phone: user["phoneNumber"] as? String
-                )
+            if let user = state["user"] as? [String: Any],
+               let next = Profile.parse(user: user, fallback: profile) {
+                applyProfile(next)
             }
         default:
             break
@@ -562,8 +575,13 @@ final class ZaloEngine {
         return a.displayName.localizedCompare(b.displayName) == .orderedAscending
     }
 
+    /// The QR `<img>` source as image bytes. The server's QR is a base64 PNG, but the official renderer draws the
+    /// self-generated / trusted-device QRs (`genSecondQR`, and `genFirstQR` in that mode) itself as
+    /// `data:image/svg+xml;utf8,<percent-encoded SVG>`; `NSImage(data:)` renders either.
     static func decodeDataURL(_ url: String) -> Data? {
         guard url.hasPrefix("data:"), let comma = url.firstIndex(of: ",") else { return nil }
-        return Data(base64Encoded: String(url[url.index(after: comma)...]))
+        let header = url[..<comma], payload = String(url[url.index(after: comma)...])
+        if header.hasSuffix(";base64") { return Data(base64Encoded: payload) }
+        return (payload.removingPercentEncoding ?? payload).data(using: .utf8)
     }
 }

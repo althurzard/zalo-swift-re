@@ -70,6 +70,9 @@ enum ChatFormat {
     /// URL scheme used for clickable @mentions (handled by `MessageRow`, never opened externally).
     static let mentionScheme = "zalomention"
 
+    /// URL scheme used for clickable detected bank-transfer entities (handled by `MessageRow`, never opened externally).
+    static let bankScheme = "olazbank"
+
     /// Link-detected text plus official @mention highlighting. Ranges are the message's
     /// `mentions` (UTF-16 offsets); a range that does not start with "@" is ignored.
     /// Mentions of me (or everyone) get a subtle background.
@@ -95,6 +98,35 @@ enum ChatFormat {
             } else {
                 out[range].link = nil
                 out[range].underlineStyle = nil
+            }
+        }
+        return out
+    }
+
+    /// Formats message text with web links, @mentions, and clickable bank-transfer entities.
+    static func formattedText(
+        _ s: String,
+        mentions: [Mention] = [],
+        bankMatches: [BankTransferMatch] = [],
+        mine: Bool,
+        myId: String?,
+        size: CGFloat = 14,
+        accent: Color = ZaloTheme.blue
+    ) -> AttributedString {
+        var out = mentions.isEmpty
+            ? linkified(s, mine: mine)
+            : mentioned(s, mentions: mentions, mine: mine, myId: myId, size: size, accent: accent)
+        guard !bankMatches.isEmpty else { return out }
+
+        for (idx, match) in bankMatches.enumerated() {
+            guard let url = URL(string: "\(bankScheme):\(idx)") else { continue }
+            for rawRange in [match.accountRange, match.bankRange] {
+                guard let attrRange = Range<AttributedString.Index>(rawRange, in: out) else { continue }
+                let hasExistingLink = out[attrRange].runs.contains { $0.link != nil }
+                guard !hasExistingLink else { continue }
+                out[attrRange].link = url
+                out[attrRange].underlineStyle = .single
+                out[attrRange].foregroundColor = mine ? .white : accent
             }
         }
         return out
@@ -134,11 +166,23 @@ struct MessageRow: View {
     @AppStorage(OlazPrefs.wallpaper) private var wallpaperStored = ChatWallpaper.none.rawValue
     @State private var hovering = false
     @State private var showsReactionPicker = false
+    @State private var selectedBankMatch: BankTransferMatch?
     private static let reactionEmojis = ["❤️", "👍", "😆", "😮", "😢", "😡"]
 
     private var mine: Bool { message.isMine }
     private var hasWallpaper: Bool { wallpaperStored != ChatWallpaper.none.rawValue }
+    private var translationStore: MessageTranslationStore { .shared }
+    private var translationState: MessageTranslationState {
+        message.translatableText == nil ? .idle : translationStore.state(for: message)
+    }
     private func scaled(_ size: CGFloat) -> CGFloat { size * textScale }
+    private func toggleTranslation() {
+        if translationState.isActiveOrVisible {
+            translationStore.collapse(conversationId: message.conversationId, messageId: message.id)
+        } else {
+            translationStore.translate(message: message)
+        }
+    }
 
     var body: some View {
         switch message.kind {
@@ -182,6 +226,27 @@ struct MessageRow: View {
                         .padding(.leading, hasWallpaper ? 4 : 12)
                 }
                 bubbleStack
+                if message.translatableText != nil, translationState.showsCard {
+                    MessageTranslationCard(
+                        message: message,
+                        state: translationState,
+                        mine: mine,
+                        allowCopy: MessageTranslationStore.allowsCopy(for: message),
+                        onSelectLanguage: { targetCode in
+                            translationStore.translate(message: message, targetCode: targetCode)
+                        },
+                        onCopy: { translatedText in
+                            engine.copyText(translatedText, in: message.conversationId)
+                        },
+                        onHide: {
+                            translationStore.collapse(conversationId: message.conversationId, messageId: message.id)
+                        },
+                        onRetry: {
+                            translationStore.retry(message: message)
+                        }
+                    )
+                    .padding(.top, 2)
+                }
                 if mine && showStatus { statusLine }
             }
             .frame(maxWidth: 520, alignment: mine ? .trailing : .leading)
@@ -259,6 +324,12 @@ struct MessageRow: View {
                         }
                     }
                 barButton("Trả lời", symbol: "arrowshape.turn.up.left") { onReply(message) }
+                if message.translatableText != nil {
+                    let showing = translationState.isActiveOrVisible
+                    barButton(showing ? "Ẩn bản dịch" : "Dịch tin nhắn", symbol: "translate") {
+                        toggleTranslation()
+                    }
+                }
                 if message.menu.forward == .available {
                     barButton("Chia sẻ", symbol: "arrowshape.turn.up.right") { engine.requestForward(message) }
                 }
@@ -353,6 +424,17 @@ struct MessageRow: View {
                     Button("Copy chú thích", systemImage: "text.quote") { engine.copyText(caption, in: message.conversationId) }
                 }
             }
+            if message.translatableText != nil {
+                if translationState.isActiveOrVisible {
+                    Button("Ẩn bản dịch", systemImage: "eye.slash") {
+                        translationStore.collapse(conversationId: message.conversationId, messageId: message.id)
+                    }
+                } else {
+                    Button("Dịch tin nhắn", systemImage: "translate") {
+                        translationStore.translate(message: message)
+                    }
+                }
+            }
             Menu("Biểu cảm", systemImage: "face.smiling") {
                 ForEach(Self.reactionEmojis, id: \.self) { emoji in
                     Button(emoji) { onReact(emoji, message) }
@@ -416,9 +498,18 @@ struct MessageRow: View {
                         .background(.black.opacity(0.5), in: Capsule()).padding(8)
                 }
         case .video(let thumbnail, let duration, let url):
-            VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: message.conversationId, messageId: message.id,
-                       senderName: mine ? "Bạn" : message.senderName, date: message.date,
-                       encrypted: message.isE2EE || url?.query?.contains("e2esession") == true)
+            if message.caption != nil {
+                VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
+                    VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: message.conversationId, messageId: message.id,
+                               senderName: mine ? "Bạn" : message.senderName, date: message.date,
+                               encrypted: message.isE2EE || url?.query?.contains("e2esession") == true)
+                    caption
+                }
+            } else {
+                VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: message.conversationId, messageId: message.id,
+                           senderName: mine ? "Bạn" : message.senderName, date: message.date,
+                           encrypted: message.isE2EE || url?.query?.contains("e2esession") == true)
+            }
         case .recalled:
             bubble(muted: true) {
                 Text("Tin nhắn đã được thu hồi").font(.system(size: scaled(13.5))).italic()
@@ -428,7 +519,18 @@ struct MessageRow: View {
                 Text("[\(type)]").font(.system(size: scaled(13.5)))
             }
         case .text:
-            bubble { textBody(message.text) }
+            let bankMatches = BankEntityDetector.detect(in: message.text)
+            if bankMatches.isEmpty {
+                bubble { textBody(message.text) }
+            } else {
+                VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
+                    bubble(tail: false) { textBody(message.text, bankMatches: bankMatches) }
+                    BankTransferChipStrip(matches: bankMatches, mine: mine, selectedMatch: $selectedBankMatch)
+                }
+                .popover(item: $selectedBankMatch, arrowEdge: mine ? .leading : .trailing) { match in
+                    BankQRPopoverView(match: match)
+                }
+            }
         case .voice(let url, let duration):
             bubble { VoiceView(url: url, duration: duration, mine: mine) }
         case .file(let name, let size, let url):
@@ -513,20 +615,34 @@ struct MessageRow: View {
         }
     }
 
-    private func textBody(_ text: String) -> some View {
-        Text(message.mentions.isEmpty
-             ? ChatFormat.linkified(text, mine: mine)
-             : ChatFormat.mentioned(text, mentions: message.mentions, mine: mine, myId: engine.profile?.userId,
-                                    size: scaled(14), accent: ChatPalette.accent(accentStored)))
-            .font(.system(size: scaled(14)))
-            .fixedSize(horizontal: false, vertical: true)
-            .environment(\.openURL, OpenURLAction { url in
+    private func textBody(_ text: String, bankMatches: [BankTransferMatch] = []) -> some View {
+        Text(ChatFormat.formattedText(
+            text,
+            mentions: message.mentions,
+            bankMatches: bankMatches,
+            mine: mine,
+            myId: engine.profile?.userId,
+            size: scaled(14),
+            accent: ChatPalette.accent(accentStored)
+        ))
+        .font(.system(size: scaled(14)))
+        .fixedSize(horizontal: false, vertical: true)
+        .environment(\.openURL, OpenURLAction { url in
+            if url.scheme == ChatFormat.mentionScheme {
                 // A clicked @mention opens that member's 1-1 chat.
-                guard url.scheme == ChatFormat.mentionScheme else { return .systemAction }
                 let uid = String(url.absoluteString.dropFirst(ChatFormat.mentionScheme.count + 1))
                 if !uid.isEmpty { engine.navigationRequest = uid }
                 return .handled
-            })
+            }
+            if url.scheme == ChatFormat.bankScheme {
+                let rawIndex = String(url.absoluteString.dropFirst(ChatFormat.bankScheme.count + 1))
+                if let index = Int(rawIndex), bankMatches.indices.contains(index) {
+                    selectedBankMatch = bankMatches[index]
+                    return .handled
+                }
+            }
+            return .systemAction
+        })
     }
 
     private var stickerPlaceholder: some View {

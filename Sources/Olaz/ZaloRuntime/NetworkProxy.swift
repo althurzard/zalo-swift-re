@@ -214,6 +214,7 @@ final class NetworkProxy: NSObject, WKScriptMessageHandlerWithReply {
         }
         let status = response.head.status
         onRequestCompleted?(helperRequest.method, url, status)
+        responseObserver?(url, status, response.body)
         return [
             "status": status,
             "statusText": response.head.statusText.isEmpty

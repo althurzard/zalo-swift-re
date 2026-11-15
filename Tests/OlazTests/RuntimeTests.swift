@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AppKit
 @testable import Olaz
 
 /// The bridge must reproduce Node's crypto byte-for-byte: the official renderer
@@ -137,5 +138,29 @@ import Foundation
             let names = storage.cookies(for: URL(string: host)!)?.map(\.name) ?? []
             #expect(names.contains("zpw_sek"), "missing zpw_sek for \(host)")
         }
+    }
+}
+
+/// The login QR reaches Swift as the official `<img>` source: a base64 PNG from the server, or (trusted-device /
+/// multi-layer QR) an SVG the renderer drew itself. Before SVG decoding, QR2 was dropped and the retired QR1 stayed
+/// on screen, so the phone answered "Mã QR không hợp lệ". Based on PR #3 by oolong20k.
+@MainActor
+@Suite struct QRDataURLDecoding {
+    @Test func decodesBase64PNG() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        #expect(ZaloEngine.decodeDataURL("data:image/png;base64," + png.base64EncodedString()) == png)
+    }
+
+    @Test func decodesPercentEncodedSVGAndItRenders() throws {
+        let svg = #"<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="40" height="40" viewBox="0 0 40 40"><rect width="100%" height="100%" fill="white"/><rect x="10" y="10" width="20" height="20" fill="black"/></svg>"#
+        // Same encoding as the official `T()`: `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`.
+        let encoded = try #require(svg.addingPercentEncoding(withAllowedCharacters: .alphanumerics))
+        let data = try #require(ZaloEngine.decodeDataURL("data:image/svg+xml;utf8," + encoded))
+        #expect(String(decoding: data, as: UTF8.self) == svg)
+        #expect(NSImage(data: data) != nil)
+    }
+
+    @Test func rejectsNonDataURLs() {
+        #expect(ZaloEngine.decodeDataURL("https://example.com/qr.png") == nil)
     }
 }

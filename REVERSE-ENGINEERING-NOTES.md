@@ -122,3 +122,16 @@ Zalo PC 26.10 keeps every database in SQLite behind its data access layer (DAL).
 - **Migration from IndexedDB**: the official path relaunches with `--db-migrate` and runs the copy inside
   `sqlite.html` / `preload-sqlite.js` (Node). Not reproduced: an install moves to SQLite with empty databases and the
   phone → PC sync brings history back.
+
+## Bank entity parsing & QR transfer (`parseBank`)
+
+In Zalo PC 26.10.20 (`app.asar`), plain-text `MSG.TEXT` messages carry no server-side bank entity metadata; detection and transfer-card resolution run on the client in two steps:
+
+- **Worker-side entity extraction (`mainless-worker.js`)**:
+  - `NeSF`: static catalog of 57 NAPAS banks with numeric IDs, short names, aliases, and context label lists (phone, identity/CCCD, forbidden numbers, payment support), e.g., OCB (`id: 21`, BIN `970448`).
+  - `Dt` / `jt.parse`: folds Vietnamese diacritics while tracking original offsets, splits subsections (newlines or 3+ spaces), extracts bank-name candidates (`findBNAMatchList`) and 5–16 digit account candidates (`findBNUMatchList`), filters currency amounts and noisy delimiters, pairs candidates within 15 tokens (`resolveEntities`), and resolves phone-format numbers (`0886xxxxxx ocb`) as bank accounts when paired with an explicit bank alias and not adjacent to a closer phone/ID label (`sdt`, `zalo`, `momo`, `cccd`, `otp`).
+- **Renderer flow (`r06Z`)**: calls `exec("parseBank")` on the worker, renders clickable entity spans, and invokes `POST /api/transfer/card` to fetch a transfer card / QR payload when tapped.
+- **Olaz native implementation**:
+  - Reproduces the 57-bank catalog and context rules in `Sources/Olaz/ZaloRuntime/BankDirectory.swift` and offline detector in `Sources/Olaz/ZaloRuntime/BankEntityDetector.swift`.
+  - Replaces the remote `POST /api/transfer/card` dependency with an offline EMVCo / NAPAS 247 TLV builder (`Sources/Olaz/ZaloRuntime/VietQRPayloadBuilder.swift`, static `010211` / dynamic `010212`, AID `A000000727`, `QRIBFTTA`, currency `704`, country `VN`, CRC-16/CCITT-FALSE `0x1021` / `0xFFFF`) and CoreImage `CIQRCodeGenerator` renderer (`VietQRImageRenderer`).
+  - Surfaces detected transfers via `olazbank` links and compact chips/popovers in `Sources/Olaz/Views/MessageBubble.swift` and `Sources/Olaz/Views/BankQRViews.swift`.

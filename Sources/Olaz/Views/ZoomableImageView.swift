@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+@preconcurrency import VisionKit
 
 /// What the zoom buttons and the percent label of a `ZoomableImageView` read and drive.
 ///
@@ -16,6 +17,7 @@ final class ZoomController {
     private(set) var hasContent = false
 
     @ObservationIgnored fileprivate weak var scrollView: ZoomScrollView?
+    var currentImage: NSImage? { scrollView?.currentImage }
 
     var percent: Int { Int((magnification * 100).rounded()) }
 
@@ -39,17 +41,21 @@ final class ZoomController {
 struct ZoomableImageView: NSViewRepresentable {
     let image: NSImage
     let zoom: ZoomController
+    var ocrEnabled: Bool = false
+    var ocrAnalysis: ImageAnalysis? = nil
 
     func makeNSView(context: Context) -> ZoomScrollView {
         let view = ZoomScrollView(frame: .zero)
         view.attach(zoom)
         view.setImage(image)
+        view.setOCR(enabled: ocrEnabled, analysis: ocrAnalysis)
         return view
     }
 
     func updateNSView(_ view: ZoomScrollView, context: Context) {
         view.attach(zoom)
         view.setImage(image)
+        view.setOCR(enabled: ocrEnabled, analysis: ocrAnalysis)
     }
 
     static func dismantleNSView(_ view: ZoomScrollView, coordinator: ()) {
@@ -79,6 +85,7 @@ private final class ZoomImageView: NSImageView {
 
 final class ZoomScrollView: NSScrollView {
     private let imageView = ZoomImageView()
+    private var ocrOverlay: ImageAnalysisOverlayView?
     private weak var controller: ZoomController?
     private var observers: [NSObjectProtocol] = []
     private var syncPending = false
@@ -87,6 +94,9 @@ final class ZoomScrollView: NSScrollView {
     /// The viewport size the current fit was computed for: layout only re-fits when it really changes.
     private var fittedViewport = NSSize.zero
     private var pan: (mouse: NSPoint, origin: NSPoint)?
+
+    var currentImage: NSImage? { imageView.image }
+    var isOCROverlayAttached: Bool { ocrOverlay != nil }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -140,6 +150,8 @@ final class ZoomScrollView: NSScrollView {
     func teardown() {
         observers.forEach(NotificationCenter.default.removeObserver)
         observers = []
+        removeOCROverlay()
+        imageView.image = nil
         if let controller {
             self.controller = nil
             Task { @MainActor in
@@ -153,10 +165,53 @@ final class ZoomScrollView: NSScrollView {
         guard imageView.image !== image else { return }
         imageView.image = image
         imageView.frame = NSRect(origin: .zero, size: image.size)
+        ocrOverlay?.frame = imageView.bounds
+        ocrOverlay?.analysis = nil
+        ocrOverlay?.setContentsRectNeedsUpdate()
         followsFit = true
         updateLimits()
         applyFit()
         scheduleSync()
+    }
+
+    /// Attaches `ImageAnalysisOverlayView` only while OCR mode is ON; removes it completely when OFF so
+    /// normal `ZoomImageView` pan, drag, and double-click zoom work identically.
+    func setOCR(enabled: Bool, analysis: ImageAnalysis?) {
+        guard enabled, imageView.image != nil else {
+            removeOCROverlay()
+            return
+        }
+        let overlay: ImageAnalysisOverlayView
+        if let existing = ocrOverlay {
+            overlay = existing
+        } else {
+            let created = ImageAnalysisOverlayView(frame: imageView.bounds)
+            created.autoresizingMask = [.width, .height]
+            created.preferredInteractionTypes = [.textSelection, .dataDetectors]
+            created.isSupplementaryInterfaceHidden = true
+            created.trackingImageView = imageView
+            imageView.addSubview(created)
+            ocrOverlay = created
+            overlay = created
+            window?.invalidateCursorRects(for: self)
+        }
+        if overlay.frame != imageView.bounds {
+            overlay.frame = imageView.bounds
+        }
+        if overlay.analysis !== analysis {
+            overlay.analysis = analysis
+        }
+        overlay.setContentsRectNeedsUpdate()
+    }
+
+    private func removeOCROverlay() {
+        guard let ocrOverlay else { return }
+        ocrOverlay.resetSelection()
+        ocrOverlay.analysis = nil
+        ocrOverlay.trackingImageView = nil
+        ocrOverlay.removeFromSuperview()
+        self.ocrOverlay = nil
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: Fit
@@ -334,7 +389,7 @@ final class ZoomScrollView: NSScrollView {
     }
 
     override func resetCursorRects() {
-        if canPan { addCursorRect(bounds, cursor: .openHand) }
+        if !isOCROverlayAttached && canPan { addCursorRect(bounds, cursor: .openHand) }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }

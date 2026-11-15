@@ -4,6 +4,7 @@ import SwiftUI
 struct SidebarAccountFooter: View {
     @Environment(ZaloEngine.self) private var engine
     @State private var hovering = false
+    @State private var showingProfileEditor = false
 
     /// A phone → PC sync is running (the phone has been pinged, or history is arriving).
     private var syncing: Bool {
@@ -24,6 +25,8 @@ struct SidebarAccountFooter: View {
     var body: some View {
         Menu {
             Button(name) {}.disabled(true)
+            Button("Hồ sơ của tôi…", systemImage: "person.crop.circle") { showingProfileEditor = true }
+                .disabled(engine.profile == nil)
             Button("Đồng bộ tin nhắn từ điện thoại…", systemImage: "arrow.triangle.2.circlepath") { engine.startTransfer() }
                 .disabled(!engine.canStartTransfer || engine.transfer != nil)
             SettingsLink { Label("Cài đặt…", systemImage: "gearshape") }
@@ -59,5 +62,9 @@ struct SidebarAccountFooter: View {
         .padding(.horizontal, 8).padding(.vertical, 6)
         .help("Tài khoản và đồng bộ")
         .accessibilityLabel("Tài khoản \(name), \(statusText)")
+        .sheet(isPresented: $showingProfileEditor) {
+            ProfileEditorSheet()
+                .environment(engine)
+        }
     }
 }

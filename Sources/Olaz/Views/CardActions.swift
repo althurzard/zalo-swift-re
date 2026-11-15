@@ -404,6 +404,10 @@ struct ContactProfileSheet: View {
     /// The adapter has not answered yet: the request may still go out, so it cannot be sent again from here.
     @State private var requestPending = false
     @State private var result: (ok: Bool, text: String)?
+    @State private var isBlocked = false
+    @State private var blockingBusy = false
+    @State private var confirmBlock = false
+    @State private var blockError: String?
 
     private var name: String {
         let own = profile?.name ?? ""
@@ -428,12 +432,16 @@ struct ContactProfileSheet: View {
             }
             if profile?.isSelf != true { actionRow }
             requestSection
+            if profile != nil, profile?.isSelf != true, !isOfficialAccount {
+                blockToggleSection
+            }
             Button("Đóng") { dismiss() }.keyboardShortcut(.cancelAction).controlSize(.small)
         }
         .padding(24)
         .frame(width: 340)
         .task {
             profile = await engine.contactProfile(request.uid)
+            isBlocked = await engine.isUserBlocked(request.uid)
             if request.startWithFriendRequest { await beginRequest() }
         }
     }
@@ -498,6 +506,67 @@ struct ContactProfileSheet: View {
 
     private func note(_ text: String) -> some View {
         Text(text).font(.system(size: 12.5)).foregroundStyle(.secondary).multilineTextAlignment(.center)
+    }
+
+    @ViewBuilder
+    private var blockToggleSection: some View {
+        VStack(spacing: 6) {
+            if isBlocked {
+                Button {
+                    toggleBlock(false)
+                } label: {
+                    if blockingBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Bỏ chặn người này", systemImage: "hand.raised.slash")
+                    }
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .disabled(blockingBusy)
+            } else {
+                Button(role: .destructive) {
+                    confirmBlock = true
+                } label: {
+                    if blockingBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Chặn người này", systemImage: "hand.raised")
+                    }
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .disabled(blockingBusy)
+                .confirmationDialog("Chặn \(name)?", isPresented: $confirmBlock, titleVisibility: .visible) {
+                    Button("Chặn", role: .destructive) { toggleBlock(true) }
+                    Button("Hủy", role: .cancel) {}
+                } message: {
+                    Text("Người này sẽ không thể nhắn tin hoặc gọi điện cho bạn.")
+                }
+            }
+            if let blockError {
+                Text(blockError)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private func toggleBlock(_ blocked: Bool) {
+        guard !blockingBusy else { return }
+        blockingBusy = true
+        blockError = nil
+        Task {
+            let outcome = await engine.setBlocked(uid: request.uid, blocked: blocked)
+            blockingBusy = false
+            switch outcome {
+            case .success:
+                isBlocked = blocked
+            case .failure(let message):
+                blockError = message
+            }
+        }
     }
 
     /// Official `_onAddFriend`: status check, request source, then the add-friend form with the default message.

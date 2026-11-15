@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+@preconcurrency import VisionKit
 
 /// What the media viewer shows: a chat photo (loaded through `RemoteImage`, official resolver fallback and E2EE included)
 /// or a video that is already on disk, plus who sent it and when (for the top bar and the window title).
@@ -99,14 +100,32 @@ struct ViewerTitlebar: Equatable {
 @MainActor
 @Observable
 final class MediaViewerState {
+    struct OCRFeedback: Equatable, Sendable {
+        enum Kind: Equatable, Sendable { case success, empty, failed }
+        let seq: Int
+        let kind: Kind
+        let text: String
+    }
+
     private(set) var item: MediaViewerItem?
     private(set) var zoom = ZoomController()
     private(set) var playback: VideoPlayback?
+    private(set) var isOCREnabled = false
+    private(set) var isAnalyzingOCR = false
+    private(set) var isCopyingOCR = false
+    private(set) var ocrAnalysis: ImageAnalysis?
+    private(set) var ocrFeedback: OCRFeedback?
     var isFullScreen = false
     var titlebar = ViewerTitlebar()
+    @ObservationIgnored private var ocrTask: Task<Void, Never>?
+    @ObservationIgnored private var copyOCRTask: Task<Void, Never>?
+    @ObservationIgnored private var ocrFeedbackTask: Task<Void, Never>?
+    @ObservationIgnored private var ocrFeedbackSeq = 0
+    @ObservationIgnored weak var engine: ZaloEngine?
 
-    func present(_ item: MediaViewerItem) {
+    func present(_ item: MediaViewerItem, engine: ZaloEngine? = nil) {
         clear()
+        self.engine = engine
         self.item = item
         zoom = ZoomController()
         if case .video(let file, _) = item.media { playback = VideoPlayback(url: file) }
@@ -114,9 +133,138 @@ final class MediaViewerState {
 
     /// Stops the player and lets go of the item (so the full-resolution image and the video are freed).
     func clear() {
+        resetOCRState()
         playback?.stop()
         playback = nil
         item = nil
+        engine = nil
+    }
+
+    // MARK: OCR
+
+    func toggleOCR() {
+        guard item?.isPhoto == true else { return }
+        if isOCREnabled {
+            isOCREnabled = false
+            ocrTask?.cancel()
+            ocrTask = nil
+            isAnalyzingOCR = false
+            ocrAnalysis = nil
+            return
+        }
+        guard ImageOCRService.isLiveTextSupported else {
+            showOCRFeedback(.failed, "Live Text không khả dụng trên máy này")
+            return
+        }
+        isOCREnabled = true
+        analyzeCurrentImageIfNeeded()
+    }
+
+    func analyzeCurrentImageIfNeeded() {
+        guard isOCREnabled,
+              item?.isPhoto == true,
+              ocrAnalysis == nil,
+              !isAnalyzingOCR,
+              let image = zoom.currentImage else { return }
+        guard !isConversationBlocked() else {
+            clear()
+            return
+        }
+        let targetItemId = item?.id
+        ocrTask?.cancel()
+        isAnalyzingOCR = true
+        ocrTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isAnalyzingOCR = false }
+            do {
+                let analysis = try await ImageOCRService.analyzeLiveText(in: image)
+                guard !Task.isCancelled, self.item?.id == targetItemId, self.isOCREnabled else { return }
+                guard !self.isConversationBlocked() else {
+                    self.clear()
+                    return
+                }
+                self.ocrAnalysis = analysis
+                if !analysis.hasResults(for: .text) && !analysis.hasResults(for: .machineReadableCode) {
+                    self.showOCRFeedback(.empty, "Không tìm thấy chữ trong ảnh")
+                }
+            } catch {
+                guard !Task.isCancelled, self.item?.id == targetItemId else { return }
+                self.showOCRFeedback(.failed, "Không quét được chữ trong ảnh")
+            }
+        }
+    }
+
+    func copyRecognizedText() {
+        guard !isCopyingOCR else { return }
+        copyOCRTask?.cancel()
+        copyOCRTask = Task { @MainActor [weak self] in
+            await self?.performCopyRecognizedText()
+        }
+    }
+
+    @discardableResult
+    func performCopyRecognizedText(from explicitImage: NSImage? = nil, pasteboard: NSPasteboard = .general) async -> OCRTextResult? {
+        guard item?.isPhoto == true, let image = explicitImage ?? zoom.currentImage else { return nil }
+        guard !isConversationBlocked() else {
+            clear()
+            return nil
+        }
+        let targetItemId = item?.id
+        isCopyingOCR = true
+        defer { isCopyingOCR = false }
+        do {
+            let result = try await ImageOCRService.recognizeText(in: image)
+            guard !Task.isCancelled, item?.id == targetItemId else { return nil }
+            guard !isConversationBlocked() else {
+                clear()
+                return nil
+            }
+            if result.isEmpty {
+                showOCRFeedback(.empty, "Không tìm thấy chữ trong ảnh")
+                return result
+            }
+            pasteboard.clearContents()
+            pasteboard.setString(result.recognizedText, forType: .string)
+            showOCRFeedback(.success, "Đã sao chép chữ")
+            return result
+        } catch {
+            guard !Task.isCancelled, item?.id == targetItemId else { return nil }
+            showOCRFeedback(.failed, "Không nhận diện được chữ")
+            return nil
+        }
+    }
+
+    private func isConversationBlocked() -> Bool {
+        if let engine, let currentItem = item {
+            return MediaViewer.mustClose(conversationId: currentItem.conversationId, engine: engine)
+        }
+        return false
+    }
+
+    private func showOCRFeedback(_ kind: OCRFeedback.Kind, _ text: String) {
+        ocrFeedbackSeq += 1
+        let feedback = OCRFeedback(seq: ocrFeedbackSeq, kind: kind, text: text)
+        ocrFeedback = feedback
+        ocrFeedbackTask?.cancel()
+        ocrFeedbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2.2))
+            guard !Task.isCancelled, let self, self.ocrFeedback == feedback else { return }
+            self.ocrFeedback = nil
+        }
+    }
+
+    private func resetOCRState() {
+        ocrTask?.cancel()
+        ocrTask = nil
+        copyOCRTask?.cancel()
+        copyOCRTask = nil
+        ocrFeedbackTask?.cancel()
+        ocrFeedbackTask = nil
+        isOCREnabled = false
+        isAnalyzingOCR = false
+        isCopyingOCR = false
+        ocrAnalysis = nil
+        ocrFeedback = nil
     }
 }
 
@@ -129,7 +277,7 @@ final class MediaViewerState {
 final class MediaViewer: NSObject, NSWindowDelegate {
     static let shared = MediaViewer()
 
-    private let state = MediaViewerState()
+    let state = MediaViewerState()
     private var window: MediaViewerWindow?
     private var hosting: NSHostingView<AnyView>?
     private var keyMonitor: Any?
@@ -148,7 +296,7 @@ final class MediaViewer: NSObject, NSWindowDelegate {
 
         let window = self.window ?? makeWindow(size: content)
         hosting?.rootView = AnyView(MediaViewerRoot(state: state, engine: engine, shell: shell))
-        state.present(item)
+        state.present(item, engine: engine)
         window.title = item.windowTitle
 
         if window.styleMask.contains(.fullScreen) {
@@ -260,25 +408,45 @@ final class MediaViewer: NSObject, NSWindowDelegate {
 
     /// True when the key was ours.
     private func handle(_ event: NSEvent) -> Bool {
+        handleKey(
+            keyCode: event.keyCode,
+            characters: event.charactersIgnoringModifiers,
+            modifiers: event.modifierFlags,
+            isRepeat: event.isARepeat
+        )
+    }
+
+    /// Handles a key event directly (exposed internally for unit tests).
+    @discardableResult
+    func handleKey(
+        keyCode: UInt16,
+        characters: String?,
+        modifiers: NSEvent.ModifierFlags,
+        isRepeat: Bool = false
+    ) -> Bool {
         guard let item = state.item else { return false }
-        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
-        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        let flags = modifiers.intersection([.command, .option, .control, .shift])
+        let key = characters?.lowercased() ?? ""
         if flags.isEmpty {
-            if event.keyCode == 53 { escape(); return true }
+            if keyCode == 53 { escape(); return true }
             if key == "f" {
-                if !event.isARepeat { toggleFullScreen() }
+                if !isRepeat { toggleFullScreen() }
+                return true
+            }
+            if key == "o", item.isPhoto {
+                if !isRepeat { state.toggleOCR() }
                 return true
             }
             guard let playback = state.playback else { return false }
-            switch event.keyCode {
-            case 49: if !event.isARepeat { playback.togglePlay() }
+            switch keyCode {
+            case 49: if !isRepeat { playback.togglePlay() }
             case 123: playback.skip(by: -5)
             case 124: playback.skip(by: 5)
             case 126: playback.adjustVolume(by: 0.1)
             case 125: playback.adjustVolume(by: -0.1)
             default:
                 guard key == "m" else { return false }
-                if !event.isARepeat { playback.toggleMute() }
+                if !isRepeat { playback.toggleMute() }
             }
             return true
         }
@@ -317,7 +485,10 @@ private struct MediaViewerRoot: View {
             }
         }
         .onChange(of: mustClose, initial: true) { _, mustClose in
-            if mustClose { Task { @MainActor in MediaViewer.shared.close() } }
+            if mustClose {
+                state.clear()
+                Task { @MainActor in MediaViewer.shared.close() }
+            }
         }
         .ignoresSafeArea()
         .environment(engine)
@@ -342,6 +513,36 @@ private struct MediaViewerContent: View {
             WindowDragArea().frame(height: 36)
             topBar
         }
+        .overlay(alignment: .bottom) {
+            if let feedback = state.ocrFeedback {
+                HStack(spacing: 8) {
+                    switch feedback.kind {
+                    case .success:
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green)
+                    case .empty:
+                        Image(systemName: "text.magnifyingglass").foregroundStyle(Color.secondary)
+                    case .failed:
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.orange)
+                    }
+                    Text(feedback.text)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .lineLimit(2)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .glassEffect(.regular, in: Capsule())
+                .padding(.bottom, 22)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .allowsHitTesting(false)
+                .accessibilityAddTraits(.updatesFrequently)
+            }
+        }
+        .animation(.snappy, value: state.ocrFeedback)
+        .onChange(of: state.zoom.hasContent) { _, hasContent in
+            if hasContent, state.isOCREnabled {
+                state.analyzeCurrentImageIfNeeded()
+            }
+        }
     }
 
     // MARK: Media
@@ -360,7 +561,14 @@ private struct MediaViewerContent: View {
                         .frame(width: 340, height: 220)
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
-                .rendering { image in ZoomableImageView(image: image, zoom: state.zoom) }
+                .rendering { image in
+                    ZoomableImageView(
+                        image: image,
+                        zoom: state.zoom,
+                        ocrEnabled: state.isOCREnabled,
+                        ocrAnalysis: state.ocrAnalysis
+                    )
+                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // The top bar gets its own band instead of covering the top of the photo.
                 .padding(.top, MediaViewerLayout.photoTopBar)
@@ -380,7 +588,10 @@ private struct MediaViewerContent: View {
             info
                 .onHover { state.playback?.setPointerOver("top", $0) }
             Spacer(minLength: 12)
-            if item.isPhoto { ZoomControls(zoom: state.zoom) }
+            if item.isPhoto {
+                ocrControls
+                ZoomControls(zoom: state.zoom)
+            }
         }
         .padding(.leading, state.titlebar.leading)
         .padding(.trailing, 16)
@@ -388,6 +599,64 @@ private struct MediaViewerContent: View {
         .opacity(barsVisible ? 1 : 0)
         .allowsHitTesting(barsVisible)
         .animation(.easeOut(duration: 0.2), value: barsVisible)
+    }
+
+    private var ocrControls: some View {
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                toggleOCRButton
+                Button { state.copyRecognizedText() } label: {
+                    HStack(spacing: 5) {
+                        Group {
+                            if state.isCopyingOCR {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 12, weight: .semibold))
+                            }
+                        }
+                        .frame(width: 14, height: 14)
+                        Text("Chép chữ")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                }
+                .buttonStyle(.glass)
+                .help("Chép toàn bộ chữ trong ảnh")
+                .accessibilityLabel("Chép chữ")
+                .disabled(state.isCopyingOCR)
+            }
+        }
+        .fixedSize()
+        .disabled(!state.zoom.hasContent)
+    }
+
+    @ViewBuilder private var toggleOCRButton: some View {
+        let label = HStack(spacing: 5) {
+            Group {
+                if state.isAnalyzingOCR {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "text.viewfinder")
+                        .font(.system(size: 12.5, weight: .semibold))
+                }
+            }
+            .frame(width: 14, height: 14)
+            Text("Quét chữ")
+                .font(.system(size: 12, weight: .medium))
+        }
+        if state.isOCREnabled {
+            Button { state.toggleOCR() } label: { label }
+                .buttonStyle(.glassProminent)
+                .help("Tắt Live Text (O)")
+                .accessibilityLabel("Quét chữ")
+                .accessibilityValue("Đang bật")
+        } else {
+            Button { state.toggleOCR() } label: { label }
+                .buttonStyle(.glass)
+                .help("Quét chữ / Live Text (O)")
+                .accessibilityLabel("Quét chữ")
+                .accessibilityValue("Đang tắt")
+        }
     }
 
     private var info: some View {
