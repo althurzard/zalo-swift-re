@@ -58,10 +58,16 @@ struct ChatView: View {
             }
         }
         .background { ChatWallpaperBackground() }
-        .safeAreaBar(edge: .top, spacing: 0) {
+        // Files dropped on the messages go out like files dropped on the composer.
+        .onDrop(of: [.fileURL, .png, .tiff, .pdf, .image], isTargeted: nil) { providers in
+            engine.handleDroppedProviders(providers, in: id)
+        }
+        // Insets, not `safeAreaBar`: a bar's scroll edge effect is laid out in the list's own coordinates, and the list is
+        // flipped (`MessageList`), so it blurred every message. The pinned bar and the composer are glass on their own.
+        .safeAreaInset(edge: .top, spacing: 0) {
             PinnedBar(conversationId: id, open: openPin)
         }
-        .safeAreaBar(edge: .bottom, spacing: 0) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             ChatComposer(
                 name: conversation.displayName,
                 conversationId: id,
@@ -304,22 +310,9 @@ struct ChatRow: Identifiable {
     static let dayPrefix = "day-"
     let id: String
     let kind: Kind
-
-    /// The row to bring back to the top after older history was prepended: the row that was there, unless it is gone. A
-    /// day separator is keyed by the day's first message, so older messages of that same day replace it; its message
-    /// stays.
-    static func restoreTarget(_ saved: String?, fallback: String, in rows: [ChatRow]) -> String {
-        guard let saved else { return fallback }
-        if rows.contains(where: { $0.id == saved }) { return saved }
-        if saved.hasPrefix(dayPrefix) {
-            let message = String(saved.dropFirst(dayPrefix.count))
-            if rows.contains(where: { $0.id == message }) { return message }
-        }
-        return fallback
-    }
 }
 
-/// Rebuilds rows only when the message array actually changed.
+/// Rebuilds rows only when the message array actually changed. Rows come out newest first: the list is drawn flipped.
 private final class RowCache {
     private var source: [ChatMessage] = []
     private var rows: [ChatRow] = []
@@ -327,7 +320,7 @@ private final class RowCache {
     func rows(for msgs: [ChatMessage]) -> [ChatRow] {
         if msgs == source { return rows }
         source = msgs
-        rows = Self.build(msgs)
+        rows = Self.build(msgs).reversed()
         return rows
     }
 
@@ -357,6 +350,13 @@ private final class RowCache {
     }
 }
 
+private extension View {
+    /// Upside down. The list is a flipped scroll view whose rows are flipped back, as chat lists are drawn: it opens on the
+    /// newest message without measuring anything above it, and older history lands at the far end of the content, so
+    /// neither loading a page nor rows measured late as they scroll in ever moves what is on screen.
+    func flippedForChat() -> some View { scaleEffect(x: 1, y: -1, anchor: .center) }
+}
+
 // MARK: - Message list
 
 private struct MessageList: View {
@@ -369,23 +369,36 @@ private struct MessageList: View {
     @Environment(ShellModel.self) private var shell
 
     @State private var cache = RowCache()
-    @State private var atTop = false
+    /// Flipped: the top edge of the content is the newest message.
+    @State private var position = ScrollPosition(edge: .top)
+    /// The safe area the bars (pinned bar, composer, toolbar) leave, applied swapped as content margins: the scroll view
+    /// ignores it, since a flipped scroll view would put the composer's inset at the top of the screen.
+    @State private var bars = EdgeInsets()
     @State private var nearBottom = true
-    @State private var lastContentHeight: CGFloat = 0
+    @State private var nearOldest = false
     @State private var loadingOlder = false
     @State private var olderTask: Task<Void, Never>?
-    @State private var topId: String?
-    @State private var restoreId: String?
-    /// False from the moment an older page lands until the reader leaves the top: one page per pull, like the official
-    /// client, instead of paging on and on while the restored position still reads as "at the top".
-    @State private var olderArmed = true
+    /// A row briefly tinted after a jump to it (a quote or a pin).
+    @State private var highlightId: String?
+    @State private var highlightTask: Task<Void, Never>?
+    /// A quoted message that is not loaded yet: older pages are fetched until it shows up (or the history ends).
+    @State private var seek: Seek?
+    @State private var quoteJump = QuoteJump()
+
+    private struct Seek: Equatable {
+        var ids: [String]
+        var pages = 0
+    }
+    /// Older pages fetched at most while looking for a quoted message.
+    private static let seekPageLimit = 25
 
     private var id: String { conversation.id }
 
     private struct Metrics: Equatable {
-        var top: CGFloat
-        var fromBottom: CGFloat
-        var content: CGFloat
+        /// Distance from the newest message (the top of the flipped content).
+        var fromNewest: CGFloat
+        /// Distance left to the oldest loaded message.
+        var toOldest: CGFloat
         var visible: CGFloat
     }
 
@@ -394,129 +407,190 @@ private struct MessageList: View {
         let rows = cache.rows(for: msgs)
         let hasMore = engine.hasMoreHistory[id] ?? false
         let newestId = msgs.last?.id
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if loadingOlder {
-                        ProgressView().controlSize(.small).padding(.vertical, 10)
-                    }
-                    ForEach(rows) { row in
-                        switch row.kind {
-                        case .day(let date):
-                            DaySeparator(date: date)
-                        case .message(let m, let first, let last, let status):
-                            MessageRow(message: m, isGroup: conversation.isGroup,
-                                       firstInGroup: first, lastInGroup: last, showStatus: status,
-                                       isNewest: m.id == newestId,
-                                       onReply: onReply,
-                                       onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) })
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                Color.clear.frame(height: 8)
+                ForEach(rows) { row in
+                    rowView(row, newestId: newestId)
+                        .background {
+                            if highlightId == row.id {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(TintShapeStyle().opacity(0.16))
+                                    .padding(.horizontal, -8)
+                                    .transition(.opacity)
+                            }
                         }
-                    }
-                    Color.clear.frame(height: 8).id("bottom")
+                        .flippedForChat()
                 }
-                .scrollTargetLayout()
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-            }
-            // Only the initial offset is anchored; later size changes must not yank the view.
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .scrollPosition(id: $topId, anchor: .top)
-            .scrollEdgeEffectStyle(.hard, for: .top)
-            .scrollEdgeEffectStyle(.soft, for: .bottom)
-            .onScrollGeometryChange(for: Metrics.self) { geo in
-                Metrics(top: geo.contentOffset.y + geo.contentInsets.top,
-                        fromBottom: geo.contentSize.height - geo.visibleRect.maxY,
-                        content: geo.contentSize.height,
-                        visible: geo.visibleRect.height)
-            } action: { _, m in
-                let top = m.top < 120
-                // Re-armed once the reader is away from the top, or when the history is too short to ever leave the top band.
-                if !olderArmed, !top || m.content - m.visible < 120 { olderArmed = true }
-                if top != atTop { atTop = top }
-                // Only user scrolling (not content growth) changes "near bottom".
-                if abs(m.content - lastContentHeight) < 1 {
-                    let near = m.fromBottom < 160
-                    if near != nearBottom { nearBottom = near }
-                }
-                lastContentHeight = m.content
-            }
-            .onChange(of: atTop) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
-            .onChange(of: olderArmed) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
-            .onChange(of: hasMore) { _, now in
-                if !now { loadingOlder = false; olderTask?.cancel() }
-                maybeLoadOlder(hasMore: now, count: msgs.count)
-            }
-            .onChange(of: msgs.first?.id) { old, _ in
-                // Older history was prepended: put the row that was at the top back there, and wait for the reader to
-                // scroll up again before the next page.
-                guard let old, let idx = msgs.firstIndex(where: { $0.id == old }), idx > 0 else { return }
-                olderArmed = false
-                // A pull saved its row; a prepend nobody asked for keeps the row on screen now (the binding still holds it).
-                let target = ChatRow.restoreTarget(restoreId ?? topId, fallback: old, in: rows)
-                restoreId = nil
-                topId = target
-                proxy.scrollTo(target, anchor: .top)
-            }
-            .onChange(of: engine.historyTicks[id] ?? 0) { _, _ in
-                // An older page arrived but every message in it is a hidden card: ask for the next one.
-                loadingOlder = false
-                olderTask?.cancel()
-                maybeLoadOlder(hasMore: hasMore, count: msgs.count)
-            }
-            .onChange(of: msgs.count) { _, _ in
-                loadingOlder = false
-                olderTask?.cancel()
-                maybeLoadOlder(hasMore: hasMore, count: msgs.count)
-            }
-            .onChange(of: msgs.last?.id) { old, _ in
-                guard old != nil else { return }
-                if nearBottom || msgs.last?.isMine == true { scrollToBottom(proxy) }
-            }
-            .onChange(of: scrollToBottomTick) { _, _ in scrollToBottom(proxy) }
-            .onChange(of: jumpTarget) { _, target in
-                guard let target else { return }
-                jumpTarget = nil
-                withAnimation(.snappy(duration: 0.3)) { proxy.scrollTo(target, anchor: .center) }
-            }
-            // The tour's message step points at the newest row: make sure it exists in the lazy stack.
-            .onChange(of: shell.tour) { _, step in if step == .message { scrollToBottom(proxy) } }
-            .onAppear {
-                DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
-            }
-            .onDisappear { olderTask?.cancel() }
-            .overlay(alignment: .bottomTrailing) {
-                if !nearBottom {
-                    Button {
-                        scrollToBottom(proxy)
-                    } label: {
-                        Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
-                    }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .padding(14)
-                    .transition(.scale.combined(with: .opacity))
-                    .accessibilityLabel("Cuộn xuống tin nhắn mới nhất")
+                if loadingOlder || seek != nil {
+                    ProgressView().controlSize(.small).padding(.vertical, 10).flippedForChat()
                 }
             }
-            .animation(.snappy(duration: 0.2), value: nearBottom)
+            .scrollTargetLayout()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+            .environment(\.quoteJump, quoteJump)
+        }
+        .contentMargins(.top, bars.bottom)
+        .contentMargins(.bottom, bars.top)
+        .scrollPosition($position)
+        .onScrollGeometryChange(for: Metrics.self) { geo in
+            Metrics(fromNewest: geo.contentOffset.y + geo.contentInsets.top,
+                    toOldest: geo.contentSize.height + geo.contentInsets.bottom - geo.visibleRect.maxY,
+                    visible: geo.visibleRect.height)
+        } action: { _, m in
+            let near = m.fromNewest < 160
+            if near != nearBottom { nearBottom = near }
+            // Prefetch well before the end: a page appended at the far end never moves the rows on screen.
+            let oldest = m.toOldest < max(600, m.visible * 1.5)
+            if oldest != nearOldest { nearOldest = oldest }
+        }
+        .flippedForChat()
+        .ignoresSafeArea(.container, edges: .vertical)
+        .background {
+            Color.clear.onGeometryChange(for: EdgeInsets.self) { $0.safeAreaInsets } action: { if bars != $0 { bars = $0 } }
+        }
+        .onChange(of: nearOldest) { _, _ in maybeLoadOlder() }
+        .onChange(of: hasMore) { _, now in
+            if !now { loadingOlder = false; olderTask?.cancel() }
+            continueSeek()
+            maybeLoadOlder()
+        }
+        .onChange(of: engine.historyTicks[id] ?? 0) { _, _ in
+            // An older page arrived but every message in it is a hidden card: ask for the next one.
+            pageArrived()
+        }
+        .onChange(of: msgs.count) { _, _ in pageArrived() }
+        .onChange(of: newestId) { old, _ in
+            guard old != nil else { return }
+            if nearBottom || msgs.last?.isMine == true { scrollToBottom() }
+        }
+        .onChange(of: scrollToBottomTick) { _, _ in scrollToBottom() }
+        .onChange(of: jumpTarget) { _, target in
+            guard let target else { return }
+            jumpTarget = nil
+            jump(to: target)
+        }
+        // The tour's message step points at the newest row: make sure it exists in the lazy stack.
+        .onChange(of: shell.tour) { _, step in if step == .message { scrollToBottom() } }
+        .onAppear {
+            quoteJump.open = { quote in openQuote(quote) }
+            maybeLoadOlder()
+        }
+        .onDisappear {
+            olderTask?.cancel()
+            highlightTask?.cancel()
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if !nearBottom {
+                Button {
+                    scrollToBottom()
+                } label: {
+                    Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .padding(14)
+                .transition(.scale.combined(with: .opacity))
+                .accessibilityLabel("Cuộn xuống tin nhắn mới nhất")
+            }
+        }
+        .animation(.snappy(duration: 0.2), value: nearBottom)
+    }
+
+    @ViewBuilder
+    private func rowView(_ row: ChatRow, newestId: String?) -> some View {
+        switch row.kind {
+        case .day(let date):
+            DaySeparator(date: date)
+        case .message(let m, let first, let last, let status):
+            MessageRow(message: m, isGroup: conversation.isGroup,
+                       firstInGroup: first, lastInGroup: last, showStatus: status,
+                       isNewest: m.id == newestId,
+                       onReply: onReply,
+                       onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) })
         }
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.snappy(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
+    private func scrollToBottom() {
+        withAnimation(.snappy(duration: 0.25)) { position.scrollTo(edge: .top) }
     }
 
-    private func maybeLoadOlder(hasMore: Bool, count: Int) {
-        guard atTop, olderArmed, hasMore, !loadingOlder, count > 0 else { return }
+    /// Brings a loaded row to the middle of the screen and tints it for a moment. A lazy stack places a row it has not
+    /// measured yet from estimates, so the scroll is repeated once the rows around it are laid out.
+    private func jump(to target: String) {
+        withAnimation(.snappy(duration: 0.3)) { position.scrollTo(id: target, anchor: .center) }
+        highlightTask?.cancel()
+        highlightTask = Task {
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            position.scrollTo(id: target, anchor: .center)
+            withAnimation(.easeOut(duration: 0.2)) { highlightId = target }
+            try? await Task.sleep(for: .seconds(1.4))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.4)) { highlightId = nil }
+        }
+    }
+
+    /// The row a quote points at, among the loaded messages.
+    private func loadedRow(for ids: [String]) -> String? {
+        let wanted = Set(ids)
+        // An album photo's row is "<message id>#<n>" when its own id is unknown.
+        return (engine.messages[id] ?? []).last { wanted.contains($0.id) || wanted.contains(String($0.id.split(separator: "#").first ?? "")) }?.id
+    }
+
+    private func openQuote(_ quote: ChatMessage.Quote) {
+        guard !quote.messageIds.isEmpty else { return }
+        if let row = loadedRow(for: quote.messageIds) {
+            seek = nil
+            jump(to: row)
+        } else if engine.hasMoreHistory[id] == true {
+            seek = Seek(ids: quote.messageIds)
+            continueSeek()
+        } else {
+            CardActionCenter.shared.show("Không tìm thấy tin nhắn gốc trong lịch sử đã tải.", in: id)
+        }
+    }
+
+    /// Next step of a pending quote lookup: jump once it is loaded, otherwise fetch one more older page.
+    private func continueSeek() {
+        guard var pending = seek else { return }
+        if let row = loadedRow(for: pending.ids) {
+            seek = nil
+            jump(to: row)
+            return
+        }
+        guard engine.hasMoreHistory[id] == true, pending.pages < Self.seekPageLimit else {
+            seek = nil
+            CardActionCenter.shared.show("Không tìm thấy tin nhắn gốc. Tin nhắn có thể đã bị xóa hoặc quá cũ.", in: id)
+            return
+        }
+        guard !loadingOlder else { return }
+        pending.pages += 1
+        seek = pending
+        requestOlder()
+    }
+
+    private func pageArrived() {
+        loadingOlder = false
         olderTask?.cancel()
+        if seek != nil { continueSeek() } else { maybeLoadOlder() }
+    }
+
+    private func maybeLoadOlder() {
+        guard nearOldest, seek == nil, !loadingOlder, engine.hasMoreHistory[id] == true, !(engine.messages[id] ?? []).isEmpty else { return }
+        requestOlder()
+    }
+
+    private func requestOlder() {
+        olderTask?.cancel()
+        loadingOlder = true
+        engine.loadOlderMessages(id)
         olderTask = Task {
-            try? await Task.sleep(for: .milliseconds(250)) // debounce
-            guard !Task.isCancelled, atTop, olderArmed, engine.hasMoreHistory[id] == true else { return }
-            restoreId = topId
-            loadingOlder = true
-            engine.loadOlderMessages(id)
             try? await Task.sleep(for: .seconds(6)) // give up the spinner if nothing arrives
-            if !Task.isCancelled { loadingOlder = false }
+            guard !Task.isCancelled else { return }
+            loadingOlder = false
+            if seek != nil { continueSeek() }
         }
     }
 }

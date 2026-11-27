@@ -635,7 +635,10 @@
     const mine = owner === '0' || owner === meNow();
     let text = safe(() => quoteText(q), '') || '';
     if (!text) text = str(q.attach) ? FALLBACK.photo : FALLBACK.unsupported;
-    return { senderName: str(q.fromD) || (mine ? myName() : nameOf(owner)) || '', text: text.slice(0, 200) };
+    // Both ids of the quoted message: a row of mine is keyed by its client id, anyone else's by the server id (`mapOne`).
+    const ids = [q.globalMsgId, q.msgId, q.cliMsgId].map((v) => (v === undefined || v === null ? '' : String(v)))
+      .filter((v) => v && v !== '0' && v !== 'undefined');
+    return { senderName: str(q.fromD) || (mine ? myName() : nameOf(owner)) || '', text: text.slice(0, 200), ids: [...new Set(ids)] };
   };
 
   // Official message.mentions: [{uid, pos, len, type}] (type 0 user / 1 all, uid '-1' = all).

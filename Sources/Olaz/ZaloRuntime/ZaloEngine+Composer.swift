@@ -298,8 +298,33 @@ extension ZaloEngine {
         }
     }
 
-    /// Resolves `[NSItemProvider]` from a SwiftUI `.onDrop` modifier into local file URLs (or temporary PNG files for dropped images)
-    /// and sends them to `conversationId`.
+    /// Dropped or pasted Finder items, sent the way the attach buttons send them: photos / videos through "Ảnh hoặc Video",
+    /// everything else (PDF, documents, archives, folders…) through "Tệp", so a PDF arrives as a file and not as a picture.
+    func sendDroppedFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
+        let (media, files) = Self.splitAttachments(urls)
+        EngineLog.shared.write("send dropped media=\(media.count) files=\(files.count)")
+        let first = media.isEmpty ? nil : await sendMedia(media, to: id)
+        let second = files.isEmpty ? nil : await sendFiles(files, to: id)
+        let outcomes = [first, second].compactMap { $0 }
+        // A failure is what the user must hear about.
+        return outcomes.first { $0 != .done && $0 != .cancelled } ?? outcomes.first ?? .cancelled
+    }
+
+    /// Photos / videos (by their type) and the rest. Folders and packages are files (zipped by `prepareAttachmentURLs`).
+    static func splitAttachments(_ urls: [URL]) -> (media: [URL], files: [URL]) {
+        var media: [URL] = [], files: [URL] = []
+        for url in urls {
+            let values = try? url.resourceValues(forKeys: [.contentTypeKey, .isDirectoryKey])
+            let type = values?.contentType ?? UTType(filenameExtension: url.pathExtension)
+            let isMedia = values?.isDirectory != true && (type.map { $0.conforms(to: .image) || $0.conforms(to: .movie) } ?? false)
+                && type?.conforms(to: .pdf) != true
+            if isMedia { media.append(url) } else { files.append(url) }
+        }
+        return (media, files)
+    }
+
+    /// Resolves `[NSItemProvider]` from a SwiftUI `.onDrop` modifier into local file URLs (or temporary files for dropped
+    /// data with no file behind it) and sends them to `conversationId`.
     @discardableResult
     func handleDroppedProviders(_ providers: [NSItemProvider], in conversationId: String) -> Bool {
         guard !conversationId.isEmpty, !providers.isEmpty else { return false }
@@ -316,14 +341,23 @@ extension ZaloEngine {
                     resolvedURLs.append(url)
                 }
             }
+            EngineLog.shared.write("drop providers=\(usable.count) → files(\(resolvedURLs.count))")
             guard !resolvedURLs.isEmpty else { return }
-            let outcome = await self.sendMedia(resolvedURLs, to: conversationId)
-            self.report(outcome, in: conversationId)
+            self.report(await self.sendDroppedFiles(resolvedURLs, to: conversationId), in: conversationId)
         }
         return true
     }
 
     private static func extractDroppedURL(from provider: NSItemProvider) async -> URL? {
+        // The Finder file itself, whatever its type: never a rendering of it.
+        if provider.canLoadObject(ofClass: URL.self) {
+            let url: URL? = await withCheckedContinuation { continuation in
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    continuation.resume(returning: url?.isFileURL == true ? url : nil)
+                }
+            }
+            if let url { return url.standardizedFileURL }
+        }
         if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             let fileURL: URL? = await withCheckedContinuation { continuation in
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { coding, _ in
@@ -340,21 +374,57 @@ extension ZaloEngine {
                     }
                 }
             }
-            if let fileURL { return fileURL }
+            if let fileURL { return fileURL.standardizedFileURL }
         }
-        for ut in [UTType.png, UTType.tiff, UTType.image, UTType.pdf] where provider.hasItemConformingToTypeIdentifier(ut.identifier) {
+        // A provider that carries the file under its content type only (no file URL): the file itself, copied out when
+        // the system hands over a temporary copy that it deletes after the callback.
+        for type in provider.registeredTypeIdentifiers.compactMap(UTType.init) where type != .fileURL && type.conforms(to: .data) {
+            let url: URL? = await withCheckedContinuation { continuation in
+                _ = provider.loadInPlaceFileRepresentation(forTypeIdentifier: type.identifier) { url, inPlace, _ in
+                    guard let url else { continuation.resume(returning: nil); return }
+                    if inPlace { continuation.resume(returning: url); return }
+                    let copy = (try? Data(contentsOf: url)).flatMap {
+                        writeTemporaryDroppedFile($0, name: provider.suggestedName ?? url.deletingPathExtension().lastPathComponent,
+                                                  ext: url.pathExtension.isEmpty ? (type.preferredFilenameExtension ?? "dat") : url.pathExtension)
+                    }
+                    continuation.resume(returning: copy)
+                }
+            }
+            if let url { return url }
+        }
+        // Dragged data with no file behind it. A PDF stays a PDF document (sent as a file); a bitmap becomes a PNG photo.
+        if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
+            let data: Data? = await withCheckedContinuation { continuation in
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.pdf.identifier) { data, _ in continuation.resume(returning: data) }
+            }
+            if let data, let url = writeTemporaryDroppedFile(data, name: provider.suggestedName, ext: "pdf") { return url }
+        }
+        for ut in [UTType.png, UTType.tiff, UTType.image] where provider.hasItemConformingToTypeIdentifier(ut.identifier) {
             let rawData: Data? = await withCheckedContinuation { continuation in
                 provider.loadDataRepresentation(forTypeIdentifier: ut.identifier) { data, _ in
                     continuation.resume(returning: data)
                 }
             }
             if let rawData, let img = NSImage(data: rawData),
-               let png = ClipboardPasteContent.renderImageToPNG(img, opaqueWhiteBackground: ut == .pdf)?.data,
+               let png = ClipboardPasteContent.renderImageToPNG(img, opaqueWhiteBackground: false)?.data,
                let tempURL = writeTemporaryPasteImage(png, prefix: "dropped") {
                 return tempURL
             }
         }
         return nil
+    }
+
+    /// Dropped bytes written under their own name (or "Tệp đính kèm") in a fresh temporary folder.
+    private static func writeTemporaryDroppedFile(_ data: Data, name: String?, ext: String) -> URL? {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("OlazAttachments", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        guard (try? fm.createDirectory(at: dir, withIntermediateDirectories: true)) != nil else { return nil }
+        var base = (name ?? "").replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { base = "Tệp đính kèm" }
+        let url = dir.appendingPathComponent(base.lowercased().hasSuffix("." + ext) ? base : base + "." + ext)
+        return (try? data.write(to: url)) != nil ? url : nil
     }
 
     // MARK: Screenshot

@@ -255,6 +255,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     struct Quote: Equatable, Sendable {
         var senderName: String
         var text: String
+        /// Ids the quoted message may be keyed by in the list (server id, client id): a tap on the quote jumps to it.
+        var messageIds: [String] = []
     }
 
     struct Reaction: Equatable, Sendable, Identifiable {
@@ -359,7 +361,8 @@ extension ChatMessage {
         func number(_ value: Any?) -> Double { (value as? NSNumber)?.doubleValue ?? 0 }
         var quote: Quote?
         if let q = json["quote"] as? [String: Any] {
-            quote = Quote(senderName: q["senderName"] as? String ?? "", text: q["text"] as? String ?? "")
+            quote = Quote(senderName: q["senderName"] as? String ?? "", text: q["text"] as? String ?? "",
+                          messageIds: q["ids"] as? [String] ?? [])
         }
         let reactions = (json["reactions"] as? [[String: Any]] ?? []).compactMap { r -> Reaction? in
             guard let icon = ReactionIcon(json: r) else { return nil }

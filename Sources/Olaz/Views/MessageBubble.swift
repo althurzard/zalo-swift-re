@@ -756,6 +756,7 @@ private struct QuoteBlock: View {
     let quote: ChatMessage.Quote
     let mine: Bool
     @Environment(\.olazTextScale) private var textScale
+    @Environment(\.quoteJump) private var quoteJump
 
     var body: some View {
         HStack(spacing: 6) {
@@ -769,7 +770,21 @@ private struct QuoteBlock: View {
         .padding(.vertical, 4).padding(.horizontal, 6)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(mine ? Color.white.opacity(0.18) : Color.primary.opacity(0.06)))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onTapGesture { if let quoteJump, !quote.messageIds.isEmpty { quoteJump.open(quote) } }
+        .help(quote.messageIds.isEmpty ? "" : "Đến tin nhắn gốc")
+        .accessibilityAddTraits(quote.messageIds.isEmpty ? [] : .isButton)
     }
+}
+
+/// Opens the message a quote points at; set by the chat's message list (`MessageList`). A reference, so the rows that read
+/// it are not invalidated each time the list redraws.
+@MainActor final class QuoteJump {
+    var open: (ChatMessage.Quote) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    @Entry var quoteJump: QuoteJump? = nil
 }
 
 /// Tapback-style chips: one small glass capsule per reaction, drawn over the bubble's top corner by `MessageRow`.

@@ -385,7 +385,7 @@ struct ChatComposer: View {
         case .files(let urls):
             if !isDrop { lastPasteGuard = (pasteboard.changeCount, Date().timeIntervalSinceReferenceDate) }
             EngineLog.shared.write("pasteboard \(isDrop ? "drop" : "paste") → files(\(urls.count))")
-            sendAttachments(urls, as: .media, to: targetConversationId)
+            sendDropped(urls, to: targetConversationId)
             return true
         case .spreadsheetOrRichImageAndText(let imageData, let imageSize, let text):
             if !isDrop { lastPasteGuard = (pasteboard.changeCount, Date().timeIntervalSinceReferenceDate) }
@@ -419,6 +419,16 @@ struct ChatComposer: View {
             defer { uploadingCount = max(0, uploadingCount - 1) }
             let outcome = kind == .media ? await engine.sendMedia(urls, to: target) : await engine.sendFiles(urls, to: target)
             engine.report(outcome, in: target)
+        }
+    }
+
+    /// Finder files dropped or pasted: photos / videos as media, the rest (PDF, documents…) as files.
+    private func sendDropped(_ urls: [URL], to target: String) {
+        guard !target.isEmpty else { return }
+        uploadingCount += 1
+        Task {
+            defer { uploadingCount = max(0, uploadingCount - 1) }
+            engine.report(await engine.sendDroppedFiles(urls, to: target), in: target)
         }
     }
 
