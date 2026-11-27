@@ -56,7 +56,8 @@ struct AssistantDraftsView: View {
     }
 }
 
-private struct DraftCard: View {
+/// One proposed reply: the customer message, the editable draft, and Bỏ / Gửi. Also shown in the menu-bar panel.
+struct DraftCard: View {
     let draft: AssistantDesk.Draft
     let desk: AssistantDesk
     @State private var text = ""

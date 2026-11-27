@@ -24,6 +24,10 @@ enum OlazPrefs {
     static let didFinishSetup = "olaz.didFinishSetup"
     /// A fresh QR sign-in happened and the setup's sync / welcome steps are still due (survives a relaunch).
     static let setupPending = "olaz.setupPending"
+    /// Menu-bar item with the pinned conversations (default on).
+    static let menuBarEnabled = "olaz.menuBar.enabled"
+    /// ⌥⌘Z toggles the menu-bar popover from any app (default on).
+    static let menuBarHotKey = "olaz.menuBar.hotKey"
 }
 
 /// Accent color picked in Settings ▸ Giao diện; applied with `.tint` at the window root, so views use `.tint` /

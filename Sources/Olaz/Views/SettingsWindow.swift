@@ -6,7 +6,7 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             Tab("Chung", systemImage: "gearshape") {
-                SettingsPane(height: 320) { GeneralSettings() }
+                SettingsPane(height: 460) { GeneralSettings() }
             }
             Tab("Giao diện", systemImage: "paintpalette") {
                 SettingsPane(height: 700) { AppearanceSettings() }
@@ -46,6 +46,8 @@ private struct SettingsPane<Content: View>: View {
 
 private struct GeneralSettings: View {
     @AppStorage("olaz.appearance") private var appearance = Appearance.system
+    @AppStorage(OlazPrefs.menuBarEnabled) private var menuBarEnabled = true
+    @AppStorage(OlazPrefs.menuBarHotKey) private var menuBarHotKey = true
 
     var body: some View {
         Section("Chế độ giao diện") {
@@ -53,6 +55,15 @@ private struct GeneralSettings: View {
                 ForEach(Appearance.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
+        }
+        Section {
+            Toggle("Hiện chat đã ghim trên menu bar", isOn: $menuBarEnabled)
+            Toggle("Mở nhanh bằng ⌥⌘Z", isOn: $menuBarHotKey)
+                .disabled(!menuBarEnabled)
+        } header: {
+            Text("Menu bar")
+        } footer: {
+            Text("Đọc và trả lời nhanh các chat đã ghim mà không cần mở cửa sổ chính.")
         }
         TranslationSettingsSection()
         // Only a bundled app has a version; a bare `swift run` binary has none to show.

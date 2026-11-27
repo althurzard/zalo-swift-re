@@ -2,8 +2,17 @@ import AppKit
 import SwiftUI
 
 struct OlazApp: App {
-    @State private var engine = ZaloEngine()
-    @State private var shell = ShellModel()
+    @State private var engine: ZaloEngine
+    @State private var shell: ShellModel
+
+    init() {
+        let engine = ZaloEngine()
+        let shell = ShellModel()
+        _engine = State(initialValue: engine)
+        _shell = State(initialValue: shell)
+        // The menu-bar item shares the engine and shell with the main window (it outlives the window).
+        MenuBarController.install(engine: engine, shell: shell)
+    }
 
     var body: some Scene {
         WindowGroup {
